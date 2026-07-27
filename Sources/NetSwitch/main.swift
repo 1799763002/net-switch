@@ -1,5 +1,6 @@
 import Foundation
 import NetSwitchCore
+import Darwin
 
 enum Shell {
     @discardableResult
@@ -936,13 +937,60 @@ func uninstallAgent() {
     } catch { fail("Could not remove LaunchAgent: \(error.localizedDescription)") }
 }
 
-func watch() -> Never {
+final class WatchInterruptState {
+    private let lock = NSLock()
+    private var value = false
+
+    var interrupted: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func markInterrupted() {
+        lock.lock()
+        value = true
+        lock.unlock()
+    }
+}
+
+func sleepUnlessInterrupted(seconds: TimeInterval, state: WatchInterruptState) {
+    let deadline = Date().addingTimeInterval(seconds)
+    while Date() < deadline && !state.interrupted {
+        Thread.sleep(forTimeInterval: 0.1)
+    }
+}
+
+func watch(returningToMenu: Bool = false) {
     log("操作 | 开始持续监看")
-    while true {
+    let interruptState = WatchInterruptState()
+    let interruptQueue = DispatchQueue(label: "net-switch.watch.interrupt")
+    let interruptSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: interruptQueue)
+    let previousInterruptHandler = signal(SIGINT, SIG_IGN)
+    interruptSource.setEventHandler {
+        interruptState.markInterrupted()
+    }
+    interruptSource.resume()
+    defer {
+        interruptSource.cancel()
+        signal(SIGINT, previousInterruptHandler)
+    }
+
+    let formatter = DateFormatter()
+    formatter.dateFormat = "HH:mm:ss"
+
+    while !interruptState.interrupted {
         print("\u{001B}[2J\u{001B}[H", terminator: "")
         printStatus(takeSnapshot())
-        print("\n每 5 秒刷新一次，按 Ctrl-C 返回终端。")
-        Thread.sleep(forTimeInterval: 5)
+        print("\n最后刷新：\(formatter.string(from: Date()))")
+        print(returningToMenu ? "每 5 秒刷新一次，按 Ctrl-C 返回菜单。" : "每 5 秒刷新一次，按 Ctrl-C 返回终端。")
+        fflush(stdout)
+        sleepUnlessInterrupted(seconds: 5, state: interruptState)
+    }
+
+    print("\n已退出持续监看。")
+    if returningToMenu {
+        Thread.sleep(forTimeInterval: 0.5)
     }
 }
 
@@ -971,7 +1019,7 @@ func interactiveMenu() -> Never {
 
 请选择操作：
   1. 刷新状态        查看当前谁正在接管网络
-  2. 持续监看        每 5 秒自动刷新，按 Ctrl-C 返回终端
+  2. 持续监看        每 5 秒自动刷新，按 Ctrl-C 返回菜单
   3. 打开软件        只打开，不自动连接
   4. 安全退出软件    按软件规则断开并退出
   5. 检查代理残留    只查看，不改动网络
@@ -986,7 +1034,7 @@ func interactiveMenu() -> Never {
 
         switch choice.trimmingCharacters(in: .whitespacesAndNewlines) {
         case "1", "": continue
-        case "2": watch()
+        case "2": watch(returningToMenu: true)
         case "3":
             if let client = chooseClient() { openClient(client); waitForMenu() }
         case "4":
