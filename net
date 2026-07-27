@@ -1,0 +1,12 @@
+#!/bin/zsh
+set -euo pipefail
+
+tool_dir="${0:A:h}"
+binary="$tool_dir/.build/release/net-switch"
+
+if [[ ! -x "$binary" ]]; then
+  echo "首次运行，正在准备网络切换助手..."
+  (cd "$tool_dir" && swift build -c release)
+fi
+
+exec "$binary" "$@"

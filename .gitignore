@@ -1,0 +1,16 @@
+.DS_Store
+.build/
+.swiftpm/
+*.xcodeproj
+DerivedData/
+
+# Local runtime output. Never commit network state, logs, or diagnostic reports.
+Library/
+Logs/
+diagnostic-*.txt
+events-*.log
+launchd.log
+
+# Local command wrappers and editor settings.
+.vscode/
+.idea/

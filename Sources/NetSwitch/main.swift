@@ -1,0 +1,1081 @@
+import Foundation
+import NetSwitchCore
+
+enum Shell {
+    @discardableResult
+    static func run(_ executable: String, _ arguments: [String] = []) -> (output: String, status: Int32) {
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.standardOutput = pipe
+        process.standardError = pipe
+        do {
+            try process.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            let output = String(data: data, encoding: .utf8) ?? ""
+            return (output, process.terminationStatus)
+        } catch {
+            return ("Unable to run \(executable): \(error.localizedDescription)", 127)
+        }
+    }
+}
+
+enum ANSI {
+    static let reset = "\u{001B}[0m"
+    static let red = "\u{001B}[31m"
+    static let green = "\u{001B}[32m"
+    static let yellow = "\u{001B}[33m"
+    static let cyan = "\u{001B}[36m"
+    static let bold = "\u{001B}[1m"
+
+    static func paint(_ text: String, _ color: String) -> String { "\(color)\(text)\(reset)" }
+}
+
+enum Client: String, CaseIterable {
+    case v2rayn, clash, powervpn, viscosity, hillstone, tailscale
+
+    var title: String {
+        switch self {
+        case .v2rayn: return "v2rayN"
+        case .clash: return "Clash Verge"
+        case .powervpn: return "PowerVPN"
+        case .viscosity: return "Viscosity"
+        case .hillstone: return "Hillstone Secure Connect"
+        case .tailscale: return "Tailscale"
+        }
+    }
+
+    var bundleID: String {
+        switch self {
+        case .v2rayn: return "2dust.v2rayN"
+        case .clash: return "io.github.clash-verge-rev.clash-verge-rev"
+        case .powervpn: return "com.leadsec.PowerVPN-Mac"
+        case .viscosity: return "com.viscosityvpn.Viscosity"
+        case .hillstone: return "com.hillstonenet.secureconnect"
+        case .tailscale: return "io.tailscale.ipn.macsys"
+        }
+    }
+
+    var appName: String {
+        switch self {
+        case .v2rayn: return "v2rayN"
+        case .clash: return "Clash Verge"
+        case .powervpn: return "PowerVPN"
+        case .viscosity: return "Viscosity"
+        case .hillstone: return "Hillstone Secure Connect"
+        case .tailscale: return "Tailscale"
+        }
+    }
+
+    var processNeedles: [String] {
+        switch self {
+        case .v2rayn: return ["/v2rayN.app/", "sing-box run"]
+        case .clash: return ["/Clash Verge.app/", "verge-mihomo"]
+        case .powervpn: return ["/PowerVPN.app/"]
+        case .viscosity: return ["/Viscosity.app/"]
+        case .hillstone: return ["/Hillstone Secure Connect.app/Contents/MacOS/HillstoneSecureConnect"]
+        case .tailscale: return ["/Tailscale.app/", "tailscaled"]
+        }
+    }
+
+    var proxyPort: Int? {
+        switch self {
+        case .v2rayn: return 10808
+        case .clash: return 7897
+        default: return nil
+        }
+    }
+}
+
+func matchesClientProcess(_ line: String, client: Client) -> Bool {
+    if client == .hillstone {
+        return client.processNeedles.contains {
+            line.localizedCaseInsensitiveContains($0)
+                && !line.localizedCaseInsensitiveContains("HillstoneSecureConnectService")
+        }
+    }
+    return client.processNeedles.contains { line.localizedCaseInsensitiveContains($0) }
+}
+
+struct ProxyEntry: Equatable {
+    let service: String
+    let type: String
+    let host: String
+    let port: Int
+}
+
+struct Snapshot {
+    let processLines: [String]
+    let proxyEntries: [ProxyEntry]
+    let connectedVPNs: [String]
+    let utunRouteLines: [String]
+    let viscosityStates: [String]
+    let tailscaleStatus: TailscaleStatus
+    let hillstoneConnectionState: HillstoneConnectionState
+    let hillstoneServiceRunning: Bool
+    let otherNetSwitchProcesses: [String]
+
+    func isRunning(_ client: Client) -> Bool {
+        processLines.contains { matchesClientProcess($0, client: client) }
+    }
+
+    func proxyIsActive(_ client: Client) -> Bool {
+        guard let port = client.proxyPort else { return false }
+        return proxyEntries.contains { $0.port == port && isLocalHost($0.host) }
+    }
+
+    var hasActivity: Bool {
+        let nonTailscaleProcess = Client.allCases
+            .filter { $0 != .tailscale }
+            .contains { isRunning($0) }
+        let effectiveVPN = connectedVPNs.contains { !$0.localizedCaseInsensitiveContains("Tailscale") }
+            || tailscaleStatus.isEffectivelyActive
+        return nonTailscaleProcess
+            || effectiveVPN
+            || hillstoneConnectionState == .connected
+            || !utunRouteLines.isEmpty
+            || hasActiveViscosityConnection
+    }
+
+    var v2Protected: Bool {
+        isRunning(.v2rayn) && !utunRouteLines.isEmpty
+    }
+
+    var hasActiveViscosityConnection: Bool {
+        viscosityStates.contains {
+            !$0.localizedCaseInsensitiveContains("disconnected")
+                && !$0.localizedCaseInsensitiveContains("automation unavailable")
+        }
+    }
+
+    var runningClientNames: [String] {
+        Client.allCases.filter { isRunning($0) }.map(\.title)
+    }
+
+    var effectiveVPNNames: [String] {
+        var names = connectedVPNs.compactMap { line -> String? in
+            if line.localizedCaseInsensitiveContains("Tailscale") { return nil }
+            if line.contains("小地球仪") { return "PowerVPN" }
+            return "其他VPN"
+        }
+        if tailscaleStatus.isEffectivelyActive { names.append("Tailscale") }
+        if hasActiveViscosityConnection { names.append("Viscosity") }
+        if hillstoneConnectionState == .connected { names.append("Hillstone") }
+        return Array(Set(names)).sorted()
+    }
+}
+
+func isLocalHost(_ host: String) -> Bool {
+    ["127.0.0.1", "localhost", "::1"].contains(host.lowercased())
+}
+
+func commandLines(_ executable: String, _ arguments: [String]) -> [String] {
+    Shell.run(executable, arguments).output
+        .split(separator: "\n")
+        .map(String.init)
+        .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+}
+
+func networkServices() -> [String] {
+    commandLines("/usr/sbin/networksetup", ["-listallnetworkservices"])
+        .dropFirst()
+        .map { $0.hasPrefix("*") ? String($0.dropFirst()).trimmingCharacters(in: .whitespaces) : $0 }
+}
+
+func parseProxy(_ text: String, service: String, type: String) -> ProxyEntry? {
+    var enabled = false
+    var host = ""
+    var port: Int?
+    for line in text.split(separator: "\n").map(String.init) {
+        let parts = line.split(separator: ":", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+        guard parts.count == 2 else { continue }
+        switch parts[0] {
+        case "Enabled": enabled = parts[1].lowercased() == "yes"
+        case "Server": host = parts[1]
+        case "Port": port = Int(parts[1])
+        default: break
+        }
+    }
+    guard enabled, let port else { return nil }
+    return ProxyEntry(service: service, type: type, host: host, port: port)
+}
+
+func currentProxyEntries() -> [ProxyEntry] {
+    var entries: [ProxyEntry] = []
+    for service in networkServices() {
+        let requests: [(String, String)] = [
+            ("HTTP", "-getwebproxy"),
+            ("HTTPS", "-getsecurewebproxy"),
+            ("SOCKS", "-getsocksfirewallproxy")
+        ]
+        for (type, command) in requests {
+            let result = Shell.run("/usr/sbin/networksetup", [command, service])
+            if let entry = parseProxy(result.output, service: service, type: type) {
+                entries.append(entry)
+            }
+        }
+    }
+    return entries
+}
+
+func connectedVPNs() -> [String] {
+    commandLines("/usr/sbin/scutil", ["--nc", "list"])
+        .filter { $0.contains("(Connected)") || $0.contains("(Connecting)") || $0.contains("(Disconnecting)") }
+}
+
+func viscosityStates(isRunning: Bool) -> [String] {
+    guard isRunning else { return [] }
+    let script = """
+    tell application id "com.viscosityvpn.Viscosity"
+      set outputLines to {}
+      repeat with itemConnection in connections
+        set end of outputLines to (name of itemConnection) & " | " & (state of itemConnection)
+      end repeat
+      return outputLines as text
+    end tell
+    """
+    let result = Shell.run("/usr/bin/osascript", ["-e", script])
+    guard result.status == 0 else { return ["Viscosity automation unavailable"] }
+    return result.output.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+}
+
+func tailscaleCLIStatus(serviceAttached: Bool, routeLines: [String]) -> TailscaleStatus {
+    let result = Shell.run("/usr/local/bin/tailscale", ["status", "--json"])
+    guard result.status == 0,
+          let data = result.output.data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        return TailscaleStatus(
+            backendState: nil,
+            active: false,
+            serviceAttached: serviceAttached,
+            hasOwnedRoutes: hasTailscaleOwnedRoutes(routeLines)
+        )
+    }
+    return TailscaleStatus(
+        backendState: object["BackendState"] as? String,
+        active: object["Active"] as? Bool ?? false,
+        serviceAttached: serviceAttached,
+        hasOwnedRoutes: hasTailscaleOwnedRoutes(routeLines)
+    )
+}
+
+func hasTailscaleOwnedRoutes(_ routeLines: [String]) -> Bool {
+    routeLines.contains { line in
+        let destination = line.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+        return destination == "100.64/10"
+            || destination == "100.100.100.100"
+            || destination.hasPrefix("100.64.")
+    }
+}
+
+func hillstoneConnectionState() -> HillstoneConnectionState {
+    let file = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/HillstoneSecureConnect/log/uisecureconnect.log")
+    guard let handle = try? FileHandle(forReadingFrom: file) else { return .unknown }
+    defer { try? handle.close() }
+    let size = (try? handle.seekToEnd()) ?? 0
+    let maximumBytes: UInt64 = 2 * 1_024 * 1_024
+    try? handle.seek(toOffset: size > maximumBytes ? size - maximumBytes : 0)
+    guard let data = try? handle.readToEnd(),
+          let text = String(data: data, encoding: .utf8) else { return .unknown }
+    return parseHillstoneConnectionState(text)
+}
+
+func hillstoneStateLabel(_ state: HillstoneConnectionState) -> String {
+    switch state {
+    case .connected: return "已连接"
+    case .disconnected: return "已断开"
+    case .unknown: return "无法确认"
+    }
+}
+
+func takeSnapshot() -> Snapshot {
+    let allProcessRows = commandLines("/bin/ps", ["ax", "-o", "pid=,command="])
+    let ownPID = ProcessInfo.processInfo.processIdentifier
+    let allProcesses = allProcessRows.compactMap { row -> String? in
+        let parts = row.trimmingCharacters(in: .whitespaces).split(maxSplits: 1, whereSeparator: \.isWhitespace)
+        guard parts.count == 2, Int32(parts[0]) != ownPID else { return nil }
+        return String(parts[1])
+    }
+    let selected = allProcesses.filter { line in
+        Client.allCases.contains { matchesClientProcess(line, client: $0) }
+    }
+    let routes = commandLines("/usr/sbin/netstat", ["-rn", "-f", "inet"])
+        .filter { $0.contains("utun") }
+    let vpnLines = connectedVPNs()
+    let tailscaleAttached = vpnLines.contains { $0.localizedCaseInsensitiveContains("Tailscale") }
+    let viscosityRunning = selected.contains { $0.localizedCaseInsensitiveContains("/Viscosity.app/") }
+    return Snapshot(
+        processLines: selected,
+        proxyEntries: currentProxyEntries(),
+        connectedVPNs: vpnLines,
+        utunRouteLines: routes,
+        viscosityStates: viscosityStates(isRunning: viscosityRunning),
+        tailscaleStatus: tailscaleCLIStatus(serviceAttached: tailscaleAttached, routeLines: routes),
+        hillstoneConnectionState: hillstoneConnectionState(),
+        hillstoneServiceRunning: allProcesses.contains {
+            $0.localizedCaseInsensitiveContains("HillstoneSecureConnectService")
+        },
+        otherNetSwitchProcesses: allProcesses.filter {
+            ($0.contains("/net-switch") || $0.contains(".build/release/net-switch"))
+                && !$0.hasSuffix("net-switch guard")
+        }
+    )
+}
+
+func statusFor(_ client: Client, snapshot: Snapshot) -> (String, String) {
+    let running = snapshot.isRunning(client)
+    switch client {
+    case .v2rayn:
+        if snapshot.v2Protected { return ("受保护", "TUN 正在接管网络，自动修复已暂停") }
+        if running { return ("运行中", "未检测到 TUN 路由") }
+        return ("已停止", "可以检查代理残留")
+    case .clash:
+        if running { return ("运行中", snapshot.proxyIsActive(client) ? "系统代理正在使用 7897" : "系统代理未开启") }
+        return ("已停止", "可以检查代理残留")
+    case .powervpn:
+        let connected = snapshot.connectedVPNs.contains { $0.contains("小地球仪") }
+        return (connected ? "已连接" : (running ? "运行中" : "已停止"), connected ? "请先在 PowerVPN 内断开，再退出" : "未检测到活动的 PowerVPN 服务")
+    case .viscosity:
+        let active = snapshot.hasActiveViscosityConnection
+        return (active ? "已连接" : (running ? "运行中" : "已停止"), active ? snapshot.viscosityStates.joined(separator: "; ") : "未检测到活动的 Viscosity 连接")
+    case .hillstone:
+        switch snapshot.hillstoneConnectionState {
+        case .connected:
+            return ("已连接", "请先在 Hillstone 内手动断开，再安全退出")
+        case .disconnected:
+            if running { return ("运行中", "VPN 已断开，可以安全退出应用") }
+            let helper = snapshot.hillstoneServiceRunning ? "；后台服务待命属于正常状态" : ""
+            return ("已停止", "未检测到活动的 Hillstone 连接\(helper)")
+        case .unknown:
+            if running { return ("需检查", "无法确认 VPN 状态，请先在 Hillstone 内手动断开") }
+            let helper = snapshot.hillstoneServiceRunning ? "后台服务待命，未发现界面程序" : "未检测到应用或连接"
+            return ("已停止", helper)
+        }
+    case .tailscale:
+        let status = snapshot.tailscaleStatus
+        if status.isInertServiceAttached {
+            return ("已停止", "后端已停止；macOS 网络扩展仍挂载，不影响后续切换")
+        }
+        if status.isEffectivelyActive {
+            return ("已连接", "Tailscale 后端或专属路由正在使用")
+        }
+        if status.backendState == nil, status.serviceAttached {
+            return ("需检查", "无法读取 Tailscale 后端状态，暂按活动连接保护")
+        }
+        return (running ? "运行中" : "已停止", running ? "应用已打开，但后端没有接管网络" : "未检测到活动的 Tailscale 服务")
+    }
+}
+
+func printStatus(_ snapshot: Snapshot) {
+    print(ANSI.paint("网络切换助手 - 当前状态", ANSI.bold + ANSI.cyan))
+    print(String(format: "%-14@ %-12@ %@", "软件" as NSString, "状态" as NSString, "提示" as NSString))
+    print(String(repeating: "-", count: 78))
+    for client in Client.allCases {
+        let (state, advice) = statusFor(client, snapshot: snapshot)
+        let color = state == "已停止" ? ANSI.green : (state == "受保护" ? ANSI.cyan : ANSI.yellow)
+        print(String(format: "%-14@ %-12@ %@", client.title as NSString, ANSI.paint(state, color) as NSString, advice as NSString))
+    }
+    let relevant = snapshot.proxyEntries.filter { [10808, 7897].contains($0.port) && isLocalHost($0.host) }
+    print("\n系统代理残留：\(relevant.isEmpty ? ANSI.paint("无", ANSI.green) : ANSI.paint("\(relevant.count) 项", ANSI.yellow))")
+    for entry in relevant { print("  \(entry.service): \(entry.type) \(entry.host):\(entry.port)") }
+    print("虚拟网卡路由：\(snapshot.utunRouteLines.isEmpty ? ANSI.paint("无", ANSI.green) : ANSI.paint("正在接管网络", ANSI.yellow))")
+    if snapshot.v2Protected { print(ANSI.paint("v2rayN 正在受保护运行：不会自动退出或清理网络。", ANSI.cyan)) }
+    if !snapshot.otherNetSwitchProcesses.isEmpty {
+        print(ANSI.paint("提示：检测到 \(snapshot.otherNetSwitchProcesses.count) 个其他 net-switch 进程，可能是未退出的菜单或清理命令。工具不会自动结束它们。", ANSI.yellow))
+    }
+}
+
+func snapshotSummary(_ snapshot: Snapshot) -> String {
+    redactedStateSummary(
+        runningClients: snapshot.runningClientNames,
+        effectiveVPNs: snapshot.effectiveVPNNames,
+        proxyCount: staleLocalProxyEntries(snapshot).count,
+        hasUtunRoutes: !snapshot.utunRouteLines.isEmpty,
+        v2Protected: snapshot.v2Protected
+    )
+}
+
+func openClient(_ client: Client) {
+    let operationID = String(UUID().uuidString.prefix(8))
+    log("操作开始 | 编号=\(operationID) | 打开 \(client.title)")
+    let result = Shell.run("/usr/bin/open", ["-b", client.bundleID])
+    guard result.status == 0 else {
+        log("操作失败 | 编号=\(operationID) | \(client.title) 未能打开")
+        print(ANSI.paint("处理失败：无法打开 \(client.title)，请确认应用仍已安装。", ANSI.red))
+        return
+    }
+    log("操作成功 | 编号=\(operationID) | 已打开 \(client.title)")
+    print(ANSI.paint("处理成功：已打开 \(client.title)，请在软件内手动连接。", ANSI.green))
+}
+
+func quitApplication(_ client: Client) -> Bool {
+    let script = "tell application id \"\(client.bundleID)\" to quit"
+    let result = Shell.run("/usr/bin/osascript", ["-e", script])
+    if result.status != 0 { print("Could not request normal quit: \(result.output)") }
+    return result.status == 0
+}
+
+func waitUntil(_ seconds: Int, _ predicate: () -> Bool) -> Bool {
+    for _ in 0..<seconds {
+        if predicate() { return true }
+        Thread.sleep(forTimeInterval: 1)
+    }
+    return predicate()
+}
+
+func processIsRunning(_ client: Client) -> Bool {
+    commandLines("/bin/ps", ["ax", "-o", "command="]).contains {
+        matchesClientProcess($0, client: client)
+    }
+}
+
+func effectiveSystemProxyUses(port: Int) -> Bool {
+    let lines = commandLines("/usr/sbin/scutil", ["--proxy"])
+    var values: [String: String] = [:]
+    for line in lines {
+        let parts = line.split(separator: ":", maxSplits: 1).map {
+            $0.trimmingCharacters(in: .whitespaces)
+        }
+        if parts.count == 2 { values[parts[0]] = parts[1] }
+    }
+    return [
+        ("HTTPEnable", "HTTPPort"),
+        ("HTTPSEnable", "HTTPSPort"),
+        ("SOCKSEnable", "SOCKSPort")
+    ].contains { enabledKey, portKey in
+        values[enabledKey] == "1" && Int(values[portKey] ?? "") == port
+    }
+}
+
+func powerVPNIsConnected() -> Bool {
+    connectedVPNs().contains { $0.contains("小地球仪") }
+}
+
+func lightweightTailscaleStatus() -> TailscaleStatus {
+    let routes = commandLines("/usr/sbin/netstat", ["-rn", "-f", "inet"]).filter { $0.contains("utun") }
+    let attached = connectedVPNs().contains { $0.localizedCaseInsensitiveContains("Tailscale") }
+    return tailscaleCLIStatus(serviceAttached: attached, routeLines: routes)
+}
+
+struct OperationContext {
+    let id: String
+    let title: String
+    let startedAt: Date
+    let before: String
+
+    init(_ title: String, snapshot: Snapshot) {
+        id = String(UUID().uuidString.prefix(8))
+        self.title = title
+        startedAt = Date()
+        before = snapshotSummary(snapshot)
+        log("操作开始 | 编号=\(id) | \(title) | 操作前=\(before)")
+        print(ANSI.paint("正在处理：\(title)（编号 \(id)）", ANSI.cyan))
+    }
+
+    func finish(result: String, detail: String, after: Snapshot? = nil) {
+        let elapsed = String(format: "%.1f", Date().timeIntervalSince(startedAt))
+        let afterText = after.map(snapshotSummary) ?? "未重新扫描"
+        log("操作\(result) | 编号=\(id) | \(title) | 耗时=\(elapsed)秒 | \(detail) | 操作后=\(afterText)")
+    }
+}
+
+@discardableResult
+func stopClient(_ client: Client, options: Set<String>) -> Bool {
+    let snapshot = takeSnapshot()
+    let operation = OperationContext("安全退出 \(client.title)", snapshot: snapshot)
+    guard snapshot.isRunning(client) || client == .tailscale else {
+        operation.finish(result: "取消", detail: "应用未运行", after: snapshot)
+        print(ANSI.paint("无需处理：\(client.title) 当前没有运行。", ANSI.yellow))
+        return false
+    }
+    switch client {
+    case .v2rayn:
+        guard options.contains("--confirm-v2rayn"), options.contains("--confirm-risk") else {
+            operation.finish(result: "拒绝", detail: "缺少双重风险确认", after: snapshot)
+            print(ANSI.paint("已拒绝：关闭 v2rayN 可能中断当前 Codex 网络，必须完成双重确认。", ANSI.red))
+            return false
+        }
+        guard quitApplication(client) else {
+            operation.finish(result: "失败", detail: "无法请求应用正常退出")
+            print(ANSI.paint("处理失败：v2rayN 未接受正常退出请求，网络未被工具改动。", ANSI.red))
+            return false
+        }
+    case .clash:
+        guard quitApplication(client) else {
+            operation.finish(result: "失败", detail: "无法请求应用正常退出")
+            print(ANSI.paint("处理失败：Clash Verge 未接受正常退出请求。", ANSI.red))
+            return false
+        }
+        guard waitUntil(15, {
+            !processIsRunning(.clash) && !effectiveSystemProxyUses(port: 7897)
+        }) else {
+            let processActive = processIsRunning(.clash)
+            let proxyActive = effectiveSystemProxyUses(port: 7897)
+            operation.finish(
+                result: "部分完成",
+                detail: "进程=\(processActive ? "仍运行" : "已退出"); 7897系统代理=\(proxyActive ? "仍启用" : "已释放")"
+            )
+            print(ANSI.paint("部分完成：已请求退出 Clash Verge，但仍需检查\(processActive ? "应用进程" : "")\(processActive && proxyActive ? "和" : "")\(proxyActive ? " 7897 系统代理" : "")。", ANSI.yellow))
+            return false
+        }
+        let after = takeSnapshot()
+        operation.finish(result: "成功", detail: "应用进程已退出；7897 系统代理已释放", after: after)
+        print(ANSI.paint("处理成功：Clash Verge 已退出，7897 系统代理已释放。", ANSI.green))
+        return true
+    case .viscosity:
+        let script = "tell application id \"com.viscosityvpn.Viscosity\" to disconnectall"
+        let result = Shell.run("/usr/bin/osascript", ["-e", script])
+        guard result.status == 0 else {
+            operation.finish(result: "失败", detail: "自动化断开请求失败")
+            print(ANSI.paint("处理失败：无法请求 Viscosity 断开连接，请检查 macOS 自动化权限。应用未被退出。", ANSI.red))
+            return false
+        }
+        guard waitUntil(15, {
+            !viscosityStates(isRunning: processIsRunning(.viscosity)).contains {
+                !$0.localizedCaseInsensitiveContains("disconnected")
+                    && !$0.localizedCaseInsensitiveContains("automation unavailable")
+            }
+        }) else {
+            operation.finish(result: "部分完成", detail: "断开请求已发送，但仍检测到活动连接")
+            print(ANSI.paint("部分完成：Viscosity 仍有活动连接，因此没有退出应用。请在应用内检查连接。", ANSI.yellow))
+            return false
+        }
+        guard quitApplication(client), waitUntil(15, { !processIsRunning(.viscosity) }) else {
+            operation.finish(result: "部分完成", detail: "连接已断开，但应用仍在运行")
+            print(ANSI.paint("部分完成：Viscosity 连接已断开，但应用仍在运行。", ANSI.yellow))
+            return false
+        }
+        let after = takeSnapshot()
+        operation.finish(result: "成功", detail: "连接已断开；应用已退出", after: after)
+        print(ANSI.paint("处理成功：Viscosity 连接已断开，应用已退出。", ANSI.green))
+        return true
+    case .powervpn:
+        guard !powerVPNIsConnected() else {
+            operation.finish(result: "拒绝", detail: "小地球仪 VPN 服务仍连接", after: snapshot)
+            print(ANSI.paint("已拒绝：小地球仪 VPN 服务仍连接。请先在 PowerVPN 内手动断开，再执行安全退出。", ANSI.red))
+            return false
+        }
+        guard quitApplication(client), waitUntil(15, { !processIsRunning(.powervpn) }) else {
+            operation.finish(result: "部分完成", detail: "VPN 已断开，但应用仍在运行")
+            print(ANSI.paint("部分完成：小地球仪已断开，但 PowerVPN 应用仍在运行。", ANSI.yellow))
+            return false
+        }
+        let after = takeSnapshot()
+        operation.finish(result: "成功", detail: "小地球仪已断开；应用已退出", after: after)
+        print(ANSI.paint("处理成功：PowerVPN 已安全退出，小地球仪保持断开。", ANSI.green))
+        return true
+    case .hillstone:
+        guard snapshot.hillstoneConnectionState == .disconnected else {
+            let detail = snapshot.hillstoneConnectionState == .connected
+                ? "检测到 Hillstone VPN 仍连接"
+                : "无法确认 Hillstone VPN 已断开"
+            operation.finish(result: "拒绝", detail: detail, after: snapshot)
+            print(ANSI.paint("已拒绝：\(detail)。请先在 Hillstone 内手动断开，再执行安全退出。", ANSI.red))
+            return false
+        }
+        guard quitApplication(client), waitUntil(15, { !processIsRunning(.hillstone) }) else {
+            operation.finish(result: "部分完成", detail: "VPN 已断开，但应用仍在运行")
+            print(ANSI.paint("部分完成：Hillstone VPN 已断开，但应用仍在运行。后台服务不会被工具停止。", ANSI.yellow))
+            return false
+        }
+        let after = takeSnapshot()
+        operation.finish(result: "成功", detail: "连接已断开；应用已退出；后台服务保持待命", after: after)
+        print(ANSI.paint("处理成功：Hillstone 已断开并退出，系统后台服务保持待命。", ANSI.green))
+        return true
+    case .tailscale:
+        let result = Shell.run("/usr/local/bin/tailscale", ["down"])
+        guard result.status == 0 else {
+            operation.finish(result: "失败", detail: "官方断开命令执行失败")
+            print(ANSI.paint("处理失败：Tailscale 未能完成断开，请在 Tailscale 应用内检查状态。", ANSI.red))
+            return false
+        }
+        guard waitUntil(15, { lightweightTailscaleStatus().isSafelyStopped }) else {
+            let status = lightweightTailscaleStatus()
+            let reason = status.hasOwnedRoutes ? "仍有 Tailscale 专属路由" : "后端状态为 \(status.backendState ?? "未知")"
+            operation.finish(result: "部分完成", detail: reason)
+            print(ANSI.paint("部分完成：已发送断开请求，但\(reason)。请在 Tailscale 应用内检查。", ANSI.yellow))
+            return false
+        }
+        let finalStatus = lightweightTailscaleStatus()
+        let detail = finalStatus.serviceAttached
+            ? "后端已停止；无专属路由；macOS 网络扩展仍挂载（不影响切换）"
+            : "后端已停止；无专属路由；网络服务已释放"
+        let after = takeSnapshot()
+        operation.finish(result: "成功", detail: detail, after: after)
+        print(ANSI.paint("处理成功：Tailscale 后端已停止且没有专属路由。", ANSI.green))
+        if finalStatus.serviceAttached {
+            print(ANSI.paint("提示：macOS 网络扩展仍显示挂载，这是非活动状态，不会阻止后续代理切换。", ANSI.yellow))
+        }
+        return true
+    }
+    let stopped = waitUntil(15, { !processIsRunning(client) })
+    if stopped {
+        let after = takeSnapshot()
+        operation.finish(result: "成功", detail: "应用已正常退出", after: after)
+        print(ANSI.paint("处理成功：\(client.title) 已正常退出。", ANSI.green))
+        return true
+    }
+    operation.finish(result: "部分完成", detail: "已请求退出，但应用进程仍运行")
+    print(ANSI.paint("部分完成：已请求退出 \(client.title)，但应用仍在运行，请手动检查。", ANSI.yellow))
+    return false
+}
+
+func staleLocalProxyEntries(_ snapshot: Snapshot) -> [ProxyEntry] {
+    snapshot.proxyEntries.filter { [10808, 7897].contains($0.port) && isLocalHost($0.host) }
+}
+
+func activityBlockers(_ snapshot: Snapshot) -> [String] {
+    var blockers: [String] = []
+    let activeClients = Client.allCases.filter {
+        $0 != .tailscale && snapshot.isRunning($0)
+    }.map(\.title)
+    if !activeClients.isEmpty {
+        blockers.append("运行中的客户端：\(activeClients.joined(separator: "、"))")
+    }
+    if !snapshot.effectiveVPNNames.isEmpty {
+        blockers.append("活动 VPN：\(snapshot.effectiveVPNNames.joined(separator: "、"))")
+    }
+    if !snapshot.utunRouteLines.isEmpty {
+        blockers.append("仍有 utun 虚拟网卡路由")
+    }
+    return blockers
+}
+
+@discardableResult
+func repair(_ confirmed: Bool, automatic: Bool = false) -> Bool {
+    let snapshot = takeSnapshot()
+    let stale = staleLocalProxyEntries(snapshot)
+    if snapshot.hasActivity {
+        if !automatic { printStatus(snapshot) }
+        let blockers = activityBlockers(snapshot)
+        log("修复拒绝 | \(blockers.joined(separator: "；")) | 状态=\(snapshotSummary(snapshot))")
+        if !automatic {
+            print(ANSI.paint("已拒绝：当前网络仍被使用，未执行任何修改。", ANSI.red))
+            blockers.forEach { print("  - \($0)") }
+            print("请先在对应软件内断开并安全退出，再重新检查。")
+        }
+        return false
+    }
+    guard !stale.isEmpty else {
+        log("修复检查 | 未发现受管本地代理残留")
+        if !automatic { print(ANSI.paint("检查完成：未发现 10808/7897 本地系统代理残留。", ANSI.green)) }
+        return true
+    }
+    guard confirmed else {
+        log("修复预检 | 发现 \(stale.count) 项受管本地代理残留，等待确认")
+        print(ANSI.paint("检查完成：发现以下可安全归属的本地代理残留：", ANSI.yellow))
+        for entry in stale { print("  \(entry.service): \(entry.type) \(entry.host):\(entry.port)") }
+        print("请从主菜单选择“清理代理残留”，并按提示确认。")
+        return true
+    }
+    log("修复开始 | 清理 \(stale.count) 项受管本地代理残留")
+    let commands: [(String, String)] = [
+        ("HTTP", "-setwebproxystate"),
+        ("HTTPS", "-setsecurewebproxystate"),
+        ("SOCKS", "-setsocksfirewallproxystate")
+    ]
+    var failures: [String] = []
+    for entry in stale {
+        guard let command = commands.first(where: { $0.0 == entry.type })?.1 else { continue }
+        let result = Shell.run("/usr/sbin/networksetup", [command, entry.service, "off"])
+        if result.status != 0 { failures.append("\(entry.service) \(entry.type): \(result.output)") }
+    }
+    if failures.isEmpty {
+        log("修复完成 | 已清理 \(stale.count) 项受管本地代理残留")
+        print(ANSI.paint("处理成功：已关闭 \(stale.count) 项受管本地系统代理。", ANSI.green))
+        return true
+    } else {
+        log("修复失败 | 部分受管本地代理残留未能清理")
+        print(ANSI.paint("处理失败：部分本地代理未能关闭，请运行“net 诊断”收集信息。", ANSI.red))
+        return false
+    }
+}
+
+func logsDirectory() -> URL {
+    FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/net-switch", isDirectory: true)
+}
+
+func pruneOldLogs() {
+    let directory = logsDirectory()
+    let cutoff = Date().addingTimeInterval(-30 * 24 * 60 * 60)
+    guard let files = try? FileManager.default.contentsOfDirectory(
+        at: directory,
+        includingPropertiesForKeys: [.contentModificationDateKey],
+        options: [.skipsHiddenFiles]
+    ) else { return }
+    for file in files where
+        (file.lastPathComponent.hasPrefix("events-") || file.lastPathComponent.hasPrefix("diagnostic-"))
+        && ["log", "txt"].contains(file.pathExtension) {
+        let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? nil
+        if let modified, modified < cutoff { try? FileManager.default.removeItem(at: file) }
+    }
+}
+
+func log(_ text: String) {
+    let directory = logsDirectory()
+    try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    pruneOldLogs()
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.dateFormat = "yyyy-MM-dd"
+    let file = directory.appendingPathComponent("events-\(formatter.string(from: Date())).log")
+    let line = "\(ISO8601DateFormatter().string(from: Date())) | \(text)\n"
+    if FileManager.default.fileExists(atPath: file.path), let handle = try? FileHandle(forWritingTo: file) {
+        _ = try? handle.seekToEnd()
+        try? handle.write(contentsOf: Data(line.utf8))
+        try? handle.close()
+    } else {
+        try? Data(line.utf8).write(to: file)
+    }
+}
+
+func showRecentLogs() {
+    let directory = logsDirectory()
+    pruneOldLogs()
+    guard let files = try? FileManager.default.contentsOfDirectory(
+        at: directory,
+        includingPropertiesForKeys: [.contentModificationDateKey],
+        options: [.skipsHiddenFiles]
+    ).filter({ $0.lastPathComponent.hasPrefix("events-") && $0.pathExtension == "log" })
+    .sorted(by: { $0.lastPathComponent > $1.lastPathComponent }), let latest = files.first else {
+        print("暂时没有操作日志。使用菜单操作、查看状态或启动后台守护后会自动创建。")
+        return
+    }
+    let lines = (try? String(contentsOf: latest, encoding: .utf8))?.split(separator: "\n").suffix(80) ?? []
+    print(ANSI.paint("最近日志：\(latest.path)", ANSI.bold + ANSI.cyan))
+    if lines.isEmpty { print("日志文件为空。") } else { lines.forEach { print($0) } }
+    print("\n说明：launchd.log 只接收后台标准输出，通常为空；实际操作和状态事件记录在上面的 events 日志中。")
+    log("操作 | 查看最近日志")
+}
+
+func openLogsDirectory() {
+    let directory = logsDirectory()
+    do {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        pruneOldLogs()
+        let result = Shell.run("/usr/bin/open", [directory.path])
+        guard result.status == 0 else {
+            log("操作失败 | 无法在 Finder 打开日志目录")
+            print(ANSI.paint("无法自动打开日志目录，请在 Finder 中按 Command-Shift-G 并输入下面路径：", ANSI.red))
+            print(directory.path)
+            return
+        }
+        log("操作成功 | 已在 Finder 打开日志目录")
+        print(ANSI.paint("已在 Finder 打开日志目录：", ANSI.green))
+        print(directory.path)
+    } catch {
+        log("操作失败 | 无法创建日志目录")
+        print(ANSI.paint("无法准备日志目录：\(directory.path)", ANSI.red))
+    }
+}
+
+func sanitizedLogLine(_ line: String) -> String {
+    redactSensitiveText(
+        line,
+        homeDirectory: FileManager.default.homeDirectoryForCurrentUser.path
+    )
+}
+
+func recentExceptionalLogLines(limit: Int) -> [String] {
+    let directory = logsDirectory()
+    guard let files = try? FileManager.default.contentsOfDirectory(
+        at: directory,
+        includingPropertiesForKeys: nil,
+        options: [.skipsHiddenFiles]
+    ).filter({ $0.lastPathComponent.hasPrefix("events-") && $0.pathExtension == "log" })
+        .sorted(by: { $0.lastPathComponent > $1.lastPathComponent }) else { return [] }
+    let markers = ["失败", "拒绝", "异常", "部分完成"]
+    return files.prefix(3).flatMap { file in
+        ((try? String(contentsOf: file, encoding: .utf8)) ?? "")
+            .split(separator: "\n")
+            .map(String.init)
+            .filter { line in markers.contains { line.contains($0) } }
+    }.suffix(limit).map(sanitizedLogLine)
+}
+
+func guardProcessStatus() -> String {
+    let result = Shell.run("/bin/launchctl", ["print", "gui/\(getuid())/local.net-switch.guard"])
+    guard result.status == 0 else { return "未加载" }
+    return result.output.contains("state = running") ? "运行中" : "已加载但未运行"
+}
+
+func portIsListening(_ port: Int) -> Bool {
+    Shell.run("/usr/sbin/lsof", ["-nP", "-iTCP:\(port)", "-sTCP:LISTEN"]).status == 0
+}
+
+@discardableResult
+func generateDiagnosticReport() -> URL? {
+    let snapshot = takeSnapshot()
+    let directory = logsDirectory()
+    do {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        pruneOldLogs()
+        let timestamp = DateFormatter()
+        timestamp.locale = Locale(identifier: "en_US_POSIX")
+        timestamp.dateFormat = "yyyyMMdd-HHmmss"
+        let file = directory.appendingPathComponent("diagnostic-\(timestamp.string(from: Date())).txt")
+        let tailscale = snapshot.tailscaleStatus
+        let recent = recentExceptionalLogLines(limit: 20)
+        let report = """
+        net-switch 脱敏诊断报告
+        生成时间：\(ISO8601DateFormatter().string(from: Date()))
+
+        当前状态
+        \(snapshotSummary(snapshot))
+        Tailscale 后端：\(tailscale.backendState ?? "无法读取")
+        Tailscale 有效活动：\(tailscale.isEffectivelyActive ? "是" : "否")
+        Tailscale 网络扩展挂载：\(tailscale.serviceAttached ? "是" : "否")
+        Tailscale 专属路由：\(tailscale.hasOwnedRoutes ? "有" : "无")
+        Hillstone 连接状态：\(hillstoneStateLabel(snapshot.hillstoneConnectionState))
+        Hillstone 后台服务：\(snapshot.hillstoneServiceRunning ? "待命" : "未运行")
+        10808 监听：\(portIsListening(10808) ? "是" : "否")
+        7897 监听：\(portIsListening(7897) ? "是" : "否")
+        utun 路由：\(snapshot.utunRouteLines.isEmpty ? "无" : "有（\(snapshot.utunRouteLines.count) 条，不记录内容）")
+        其他 net-switch 进程：\(snapshot.otherNetSwitchProcesses.count)
+        后台守护：\(guardProcessStatus())
+
+        最近异常（已脱敏）
+        \(recent.isEmpty ? "无" : recent.joined(separator: "\n"))
+
+        隐私说明
+        本报告不记录节点、订阅、账号、密码、服务器地址、完整路由表或完整命令输出。
+        """
+        try Data(report.utf8).write(to: file, options: .atomic)
+        log("操作成功 | 已生成脱敏诊断报告 \(file.lastPathComponent)")
+        print(ANSI.paint("诊断报告已生成：", ANSI.green))
+        print(file.path)
+        return file
+    } catch {
+        log("操作失败 | 无法生成脱敏诊断报告")
+        print(ANSI.paint("处理失败：无法生成诊断报告。", ANSI.red))
+        return nil
+    }
+}
+
+func logsAndDiagnosticsMenu() {
+    print("""
+
+日志与诊断：
+  1. 查看最近日志    显示最近 80 条记录
+  2. 打开日志目录    在 Finder 中打开隐藏目录
+  3. 生成诊断报告    保存脱敏后的状态与最近异常
+  0. 返回
+""")
+    print("请输入数字：", terminator: "")
+    switch readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) {
+    case "1": showRecentLogs()
+    case "2": openLogsDirectory()
+    case "3": _ = generateDiagnosticReport()
+    default: return
+    }
+}
+
+func guardLoop() -> Never {
+    log("守护启动 | 每 5 秒检查，空闲 10 秒后仅清理受管本地代理残留")
+    var quietSince: Date?
+    var lastSummary = ""
+    while true {
+        let snapshot = takeSnapshot()
+        let summary = snapshotSummary(snapshot)
+        if summary != lastSummary { log("守护状态 | \(summary)"); lastSummary = summary }
+        if snapshot.hasActivity {
+            quietSince = nil
+        } else if let since = quietSince, Date().timeIntervalSince(since) >= 10 {
+            if !staleLocalProxyEntries(snapshot).isEmpty {
+                log("自动修复开始 | 已空闲 10 秒")
+                repair(true, automatic: true)
+                log("自动修复结束")
+            }
+            quietSince = Date()
+        } else {
+            quietSince = Date()
+        }
+        Thread.sleep(forTimeInterval: 5)
+    }
+}
+
+func plistPath() -> URL {
+    FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents/local.net-switch.guard.plist")
+}
+
+func installAgent() {
+    let executable = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.path
+    guard executable.hasPrefix("/") else { fail("Install requires an absolute path to the built net-switch executable.") }
+    let path = plistPath()
+    let plist: [String: Any] = [
+        "Label": "local.net-switch.guard",
+        "ProgramArguments": [executable, "guard"],
+        "RunAtLoad": true,
+        "KeepAlive": true,
+        "StandardOutPath": logsDirectory().appendingPathComponent("launchd.log").path,
+        "StandardErrorPath": logsDirectory().appendingPathComponent("launchd.log").path
+    ]
+    do {
+        try FileManager.default.createDirectory(at: logsDirectory(), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+        try data.write(to: path, options: .atomic)
+        _ = Shell.run("/bin/launchctl", ["bootout", "gui/\(getuid())", path.path])
+        let result = Shell.run("/bin/launchctl", ["bootstrap", "gui/\(getuid())", path.path])
+        guard result.status == 0 else { fail("LaunchAgent file was written but could not start: \(result.output)") }
+        log("守护安装 | 已注册登录后自动启动")
+        print("Installed net-switch guard. Log: \(logsDirectory().path)")
+    } catch { fail("Could not install LaunchAgent: \(error.localizedDescription)") }
+}
+
+func uninstallAgent() {
+    let path = plistPath()
+    _ = Shell.run("/bin/launchctl", ["bootout", "gui/\(getuid())", path.path])
+    do {
+        if FileManager.default.fileExists(atPath: path.path) { try FileManager.default.removeItem(at: path) }
+        log("守护卸载 | 已移除登录后自动启动")
+        print("Removed net-switch LaunchAgent.")
+    } catch { fail("Could not remove LaunchAgent: \(error.localizedDescription)") }
+}
+
+func watch() -> Never {
+    log("操作 | 开始持续监看")
+    while true {
+        print("\u{001B}[2J\u{001B}[H", terminator: "")
+        printStatus(takeSnapshot())
+        print("\n每 5 秒刷新一次，按 Ctrl-C 返回终端。")
+        Thread.sleep(forTimeInterval: 5)
+    }
+}
+
+func waitForMenu() {
+    print("\n按回车键返回菜单...", terminator: "")
+    _ = readLine()
+}
+
+func chooseClient() -> Client? {
+    print("\n请选择软件：")
+    for (index, client) in Client.allCases.enumerated() {
+        print("  \(index + 1). \(client.title)")
+    }
+    print("  0. 返回")
+    print("请输入数字：", terminator: "")
+    guard let text = readLine(), let index = Int(text), index > 0, index <= Client.allCases.count else { return nil }
+    return Client.allCases[index - 1]
+}
+
+func interactiveMenu() -> Never {
+    while true {
+        print("\u{001B}[2J\u{001B}[H", terminator: "")
+        let snapshot = takeSnapshot()
+        printStatus(snapshot)
+        print("""
+
+请选择操作：
+  1. 刷新状态        查看当前谁正在接管网络
+  2. 持续监看        每 5 秒自动刷新，按 Ctrl-C 返回终端
+  3. 打开软件        只打开，不自动连接
+  4. 安全退出软件    按软件规则断开并退出
+  5. 检查代理残留    只查看，不改动网络
+  6. 清理代理残留    仅在全部软件停止后可执行
+  7. 开机自动守护    安装后台检查与自动清理
+  8. 日志与诊断      查看日志、打开目录或生成脱敏报告
+  0. 退出助手
+""")
+        print("请输入数字：", terminator: "")
+        guard let choice = readLine() else { exit(0) }
+        log("菜单操作 | 选择 \(choice.trimmingCharacters(in: .whitespacesAndNewlines))")
+
+        switch choice.trimmingCharacters(in: .whitespacesAndNewlines) {
+        case "1", "": continue
+        case "2": watch()
+        case "3":
+            if let client = chooseClient() { openClient(client); waitForMenu() }
+        case "4":
+            guard let client = chooseClient() else { continue }
+            if client == .v2rayn {
+                print(ANSI.paint("警告：关闭 v2rayN 会中断当前海外网络与 Codex 会话。", ANSI.red))
+                print("输入 关闭v2 确认：", terminator: "")
+                guard readLine() == "关闭v2" else { print("已取消。"); waitForMenu(); continue }
+                print("再次输入 确认 继续：", terminator: "")
+                guard readLine() == "确认" else { print("已取消。"); waitForMenu(); continue }
+                stopClient(client, options: ["--confirm-v2rayn", "--confirm-risk"])
+            } else {
+                stopClient(client, options: [])
+            }
+            waitForMenu()
+        case "5":
+            repair(false)
+            waitForMenu()
+        case "6":
+            let current = takeSnapshot()
+            if current.hasActivity {
+                repair(false)
+                waitForMenu()
+                continue
+            }
+            print("将只关闭 10808/7897 的本地系统代理。输入 清理 确认：", terminator: "")
+            if readLine() == "清理" { repair(true) } else { print("已取消。") }
+            waitForMenu()
+        case "7":
+            print("将安装登录后常驻的后台守护。输入 安装 确认：", terminator: "")
+            if readLine() == "安装" { installAgent() } else { print("已取消。") }
+            waitForMenu()
+        case "8":
+            logsAndDiagnosticsMenu()
+            waitForMenu()
+        case "0", "q", "Q": exit(0)
+        default:
+            print("无效选项，请输入 0 到 8。")
+            waitForMenu()
+        }
+    }
+}
+
+func fail(_ message: String) -> Never {
+    log("异常 | \(message)")
+    fputs("\(ANSI.paint("Error:", ANSI.red)) \(message)\n", stderr)
+    exit(1)
+}
+
+func usage() {
+    print("""
+    网络切换助手
+
+    最简单的使用方式：直接运行 net，按数字选择操作。
+    快捷命令：
+      net 看         只看一次当前状态
+      net 监看       持续显示状态
+      net 清理       检查可清理的代理残留（不会直接清理）
+      net 日志       查看最近 80 条操作与异常记录
+      net 日志目录   在 Finder 中打开日志目录
+      net 诊断       生成不含账号和节点信息的脱敏报告
+
+    高级命令：status、watch、guard、start、stop、repair、install、uninstall
+    """)
+}
+
+let arguments = Array(CommandLine.arguments.dropFirst())
+guard let command = arguments.first else { interactiveMenu() }
+let options = Set(arguments.filter { $0.hasPrefix("--") })
+
+switch command {
+case "status", "看", "状态":
+    log("操作 | 查看一次状态")
+    printStatus(takeSnapshot())
+case "watch", "监看": watch()
+case "guard": guardLoop()
+case "start":
+    guard arguments.count >= 2, let client = Client(rawValue: arguments[1]) else { usage(); exit(1) }
+    openClient(client)
+case "stop":
+    guard arguments.count >= 2, let client = Client(rawValue: arguments[1]) else { usage(); exit(1) }
+    if !stopClient(client, options: options) { exit(1) }
+case "repair", "清理":
+    if !repair(options.contains("--confirm")) { exit(1) }
+case "日志": showRecentLogs()
+case "日志目录": openLogsDirectory()
+case "诊断": _ = generateDiagnosticReport()
+case "install": installAgent()
+case "uninstall": uninstallAgent()
+case "help", "--help", "-h": usage()
+default: usage(); exit(1)
+}
