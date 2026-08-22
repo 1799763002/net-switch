@@ -44,6 +44,8 @@ net 日志目录     # open the local log directory in Finder
 net 诊断         # create a redacted diagnostic report
 ```
 
+Interactive confirmations accept `y` or `yes`; `n`, `no`, and Enter cancel. For command-line use, pass `--yes`, for example `net stop bywave --yes`.
+
 Run tests with:
 
 ```bash
@@ -57,7 +59,7 @@ Use one network owner at a time. Before switching, disconnect in the original cl
 Special handling:
 
 - **v2rayN**: an active TUN route is protected. The tool will not automatically exit it or clear network settings.
-- **ByWave**: recognizes local proxy port `7893`; stopping requires two confirmations, and its root helper service is left untouched.
+- **ByWave**: recognizes local proxy port `7893` and its live TUN state; after one confirmation it disables TUN through the local Mihomo API before quitting, while leaving the root helper service untouched.
 - **Clash Verge**: verifies that both the application and local proxy port `7897` are released on exit.
 - **Viscosity**: uses its AppleScript automation interface to disconnect connections before exiting.
 - **PowerVPN**: refuses to exit while the configured macOS VPN service remains connected.

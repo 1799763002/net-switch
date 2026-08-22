@@ -123,6 +123,7 @@ struct Snapshot {
     let tailscaleStatus: TailscaleStatus
     let hillstoneConnectionState: HillstoneConnectionState
     let hillstoneServiceRunning: Bool
+    let byWaveTunEnabled: Bool
     let otherNetSwitchProcesses: [String]
 
     func isRunning(_ client: Client) -> Bool {
@@ -177,6 +178,36 @@ struct Snapshot {
 
 func isLocalHost(_ host: String) -> Bool {
     ["127.0.0.1", "localhost", "::1"].contains(host.lowercased())
+}
+
+func byWaveTunIsEnabled() -> Bool {
+    let result = Shell.run("/usr/bin/curl", [
+        "-fsS", "--max-time", "1", "http://127.0.0.1:9090/configs"
+    ])
+    guard result.status == 0,
+          let data = result.output.data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let tun = object["tun"] as? [String: Any],
+          let enabled = tun["enable"] as? Bool else { return false }
+    return enabled
+}
+
+func disableByWaveTun() -> Bool {
+    let result = Shell.run("/usr/bin/curl", [
+        "-fsS", "--max-time", "3", "-X", "PATCH",
+        "-H", "Content-Type: application/json",
+        "--data", "{\"tun\":{\"enable\":false}}",
+        "http://127.0.0.1:9090/configs"
+    ])
+    return result.status == 0
+}
+
+func confirmYesNo(_ prompt: String) -> Bool {
+    print("\(prompt) [y/N]: ", terminator: "")
+    guard let answer = readLine()?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else {
+        return false
+    }
+    return answer == "y" || answer == "yes"
 }
 
 func commandLines(_ executable: String, _ arguments: [String]) -> [String] {
@@ -326,6 +357,7 @@ func takeSnapshot() -> Snapshot {
         hillstoneServiceRunning: allProcesses.contains {
             $0.localizedCaseInsensitiveContains("HillstoneSecureConnectService")
         },
+        byWaveTunEnabled: byWaveTunIsEnabled(),
         otherNetSwitchProcesses: allProcesses.filter {
             ($0.contains("/net-switch") || $0.contains(".build/release/net-switch"))
                 && !$0.hasSuffix("net-switch guard")
@@ -342,8 +374,11 @@ func statusFor(_ client: Client, snapshot: Snapshot) -> (String, String) {
         return ("已停止", "可以检查代理残留")
     case .bywave:
         if running {
-            if snapshot.proxyIsActive(client) { return ("运行中", "系统代理正在使用 7893") }
-            let tunHint = snapshot.utunRouteLines.isEmpty ? "TUN 状态请在应用内确认" : "检测到 utun 路由，可能正在使用 TUN"
+            if snapshot.proxyIsActive(client) {
+                let tunHint = snapshot.byWaveTunEnabled ? "；TUN 同时启用" : ""
+                return ("运行中", "系统代理正在使用 7893\(tunHint)")
+            }
+            let tunHint = snapshot.byWaveTunEnabled ? "ByWave TUN 正在接管网络" : "ByWave TUN 未启用"
             return ("运行中", "系统代理未开启；\(tunHint)")
         }
         return ("已停止", "可以检查代理残留")
@@ -508,9 +543,11 @@ func stopClient(_ client: Client, options: Set<String>) -> Bool {
     }
     switch client {
     case .v2rayn:
-        guard options.contains("--confirm-v2rayn"), options.contains("--confirm-risk") else {
-            operation.finish(result: "拒绝", detail: "缺少双重风险确认", after: snapshot)
-            print(ANSI.paint("已拒绝：关闭 v2rayN 可能中断当前 Codex 网络，必须完成双重确认。", ANSI.red))
+        let confirmed = options.contains("--yes")
+            || (options.contains("--confirm-v2rayn") && options.contains("--confirm-risk"))
+        guard confirmed else {
+            operation.finish(result: "拒绝", detail: "缺少确认", after: snapshot)
+            print(ANSI.paint("已拒绝：关闭 v2rayN 可能中断当前网络，请使用 --yes 明确确认。", ANSI.red))
             return false
         }
         guard quitApplication(client) else {
@@ -519,14 +556,23 @@ func stopClient(_ client: Client, options: Set<String>) -> Bool {
             return false
         }
     case .bywave:
-        guard options.contains("--confirm-bywave"), options.contains("--confirm-risk") else {
-            operation.finish(result: "拒绝", detail: "缺少双重风险确认", after: snapshot)
-            print(ANSI.paint("已拒绝：关闭 ByWave 可能中断当前 Codex 网络，必须完成双重确认。", ANSI.red))
+        let confirmed = options.contains("--yes")
+            || (options.contains("--confirm-bywave") && options.contains("--confirm-risk"))
+        guard confirmed else {
+            operation.finish(result: "拒绝", detail: "缺少确认", after: snapshot)
+            print(ANSI.paint("已拒绝：关闭 ByWave 可能中断当前网络，请使用 --yes 明确确认。", ANSI.red))
             return false
         }
+        if snapshot.byWaveTunEnabled {
+            guard disableByWaveTun(), waitUntil(10, { !byWaveTunIsEnabled() }) else {
+                operation.finish(result: "失败", detail: "ByWave TUN 未能通过本地控制接口释放")
+                print(ANSI.paint("处理失败：ByWave TUN 仍在接管网络，已停止后续退出操作。", ANSI.red))
+                return false
+            }
+        }
         guard quitApplication(client) else {
-            operation.finish(result: "失败", detail: "无法请求应用正常退出")
-            print(ANSI.paint("处理失败：ByWave 未接受正常退出请求，网络未被工具改动。", ANSI.red))
+            operation.finish(result: "部分完成", detail: "TUN 已停用，但无法请求应用正常退出")
+            print(ANSI.paint("部分完成：ByWave TUN 已停用，但应用未接受正常退出请求。", ANSI.yellow))
             return false
         }
         guard waitUntil(15, {
@@ -542,8 +588,8 @@ func stopClient(_ client: Client, options: Set<String>) -> Bool {
             return false
         }
         let after = takeSnapshot()
-        operation.finish(result: "成功", detail: "应用进程已退出；7893 系统代理已释放；后台辅助服务未改动", after: after)
-        print(ANSI.paint("处理成功：ByWave 已退出，7893 系统代理已释放。", ANSI.green))
+        operation.finish(result: "成功", detail: "TUN 已停用；应用进程已退出；7893 系统代理已释放；后台辅助服务未改动", after: after)
+        print(ANSI.paint("处理成功：ByWave TUN 已停用，应用已退出，7893 系统代理已释放。", ANSI.green))
         return true
     case .clash:
         guard quitApplication(client) else {
@@ -1082,14 +1128,9 @@ func interactiveMenu() -> Never {
         case "4":
             guard let client = chooseClient() else { continue }
             if client == .v2rayn || client == .bywave {
-                let keyword = client == .v2rayn ? "关闭v2" : "关闭ByWave"
                 print(ANSI.paint("警告：关闭 \(client.title) 可能中断当前海外网络与 Codex 会话。", ANSI.red))
-                print("输入 \(keyword) 确认：", terminator: "")
-                guard readLine() == keyword else { print("已取消。"); waitForMenu(); continue }
-                print("再次输入 确认 继续：", terminator: "")
-                guard readLine() == "确认" else { print("已取消。"); waitForMenu(); continue }
-                let confirmation = client == .v2rayn ? "--confirm-v2rayn" : "--confirm-bywave"
-                stopClient(client, options: [confirmation, "--confirm-risk"])
+                guard confirmYesNo("确定继续吗？") else { print("已取消。"); waitForMenu(); continue }
+                stopClient(client, options: ["--yes"])
             } else {
                 stopClient(client, options: [])
             }
@@ -1104,12 +1145,12 @@ func interactiveMenu() -> Never {
                 waitForMenu()
                 continue
             }
-            print("将只关闭 10808/7893/7897 的本地系统代理。输入 清理 确认：", terminator: "")
-            if readLine() == "清理" { repair(true) } else { print("已取消。") }
+            if confirmYesNo("将只关闭 10808/7893/7897 的本地系统代理，确定继续吗？") {
+                repair(true)
+            } else { print("已取消。") }
             waitForMenu()
         case "7":
-            print("将安装登录后常驻的后台守护。输入 安装 确认：", terminator: "")
-            if readLine() == "安装" { installAgent() } else { print("已取消。") }
+            if confirmYesNo("安装登录后常驻的后台守护吗？") { installAgent() } else { print("已取消。") }
             waitForMenu()
         case "8":
             logsAndDiagnosticsMenu()
@@ -1141,6 +1182,8 @@ func usage() {
       net 日志目录   在 Finder 中打开日志目录
       net 诊断       生成不含账号和节点信息的脱敏报告
 
+    危险操作确认统一支持 y/yes；命令行可使用 --yes，例如：net stop bywave --yes
+
     高级命令：status、watch、guard、start、stop、repair、install、uninstall
     """)
 }
@@ -1162,7 +1205,7 @@ case "stop":
     guard arguments.count >= 2, let client = Client(rawValue: arguments[1]) else { usage(); exit(1) }
     if !stopClient(client, options: options) { exit(1) }
 case "repair", "清理":
-    if !repair(options.contains("--confirm")) { exit(1) }
+    if !repair(options.contains("--yes") || options.contains("--confirm")) { exit(1) }
 case "日志": showRecentLogs()
 case "日志目录": openLogsDirectory()
 case "诊断": _ = generateDiagnosticReport()
