@@ -13,6 +13,7 @@
 ## 支持的软件
 
 - v2rayN
+- ByWave
 - Clash Verge
 - PowerVPN
 - Viscosity
@@ -63,6 +64,7 @@ swift test
 ## 重要保护规则
 
 - **v2rayN**：检测到 TUN 路由时显示“受保护”。工具不会自动退出 v2rayN 或清理网络，手动停止必须两次确认。
+- **ByWave**：识别 `7893` 系统代理；安全退出需要两次确认，并保留其 root 后台辅助服务。
 - **Clash Verge**：退出时检查应用进程与 `7897` 系统代理是否都已释放。
 - **PowerVPN**：当指定 macOS VPN 服务仍连接时，工具拒绝退出。
 - **Viscosity**：先通过 AppleScript 断开连接，再退出应用；第一次使用可能要求 macOS 授予自动化权限。

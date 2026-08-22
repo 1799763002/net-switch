@@ -7,9 +7,9 @@
 ## What it does
 
 - Provides a Chinese interactive terminal menu and short commands such as `net`, `net 看`, `net 日志`, and `net 诊断`.
-- Detects v2rayN, Clash Verge, PowerVPN, Viscosity, Hillstone Secure Connect, and Tailscale using local process and platform state only.
+- Detects v2rayN, ByWave, Clash Verge, PowerVPN, Viscosity, Hillstone Secure Connect, and Tailscale using local process and platform state only.
 - Protects an active v2rayN TUN connection: automatic cleanup is skipped and stopping it requires two explicit confirmations.
-- Cleans only local HTTP/HTTPS/SOCKS proxy entries that point to `127.0.0.1:10808` or `127.0.0.1:7897`, and only after managed clients are inactive.
+- Cleans only local HTTP/HTTPS/SOCKS proxy entries that point to `127.0.0.1:10808`, `127.0.0.1:7893`, or `127.0.0.1:7897`, and only after managed clients are inactive.
 - Records local operation events and can generate a redacted diagnostic report.
 
 It does not store or upload subscriptions, proxy nodes, passwords, VPN credentials, connection profiles, server addresses, DNS configuration, or complete route tables.
@@ -57,6 +57,8 @@ Use one network owner at a time. Before switching, disconnect in the original cl
 Special handling:
 
 - **v2rayN**: an active TUN route is protected. The tool will not automatically exit it or clear network settings.
+- **ByWave**: recognizes local proxy port `7893`; stopping requires two confirmations, and its root helper service is left untouched.
+- **Clash Verge**: verifies that both the application and local proxy port `7897` are released on exit.
 - **Viscosity**: uses its AppleScript automation interface to disconnect connections before exiting.
 - **PowerVPN**: refuses to exit while the configured macOS VPN service remains connected.
 - **Hillstone Secure Connect**: uses redacted local lifecycle state to decide whether a connection is active; its vendor background service is never stopped.

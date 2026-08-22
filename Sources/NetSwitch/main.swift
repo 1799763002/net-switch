@@ -35,11 +35,12 @@ enum ANSI {
 }
 
 enum Client: String, CaseIterable {
-    case v2rayn, clash, powervpn, viscosity, hillstone, tailscale
+    case v2rayn, bywave, clash, powervpn, viscosity, hillstone, tailscale
 
     var title: String {
         switch self {
         case .v2rayn: return "v2rayN"
+        case .bywave: return "ByWave"
         case .clash: return "Clash Verge"
         case .powervpn: return "PowerVPN"
         case .viscosity: return "Viscosity"
@@ -51,6 +52,7 @@ enum Client: String, CaseIterable {
     var bundleID: String {
         switch self {
         case .v2rayn: return "2dust.v2rayN"
+        case .bywave: return "com.bywave.client"
         case .clash: return "io.github.clash-verge-rev.clash-verge-rev"
         case .powervpn: return "com.leadsec.PowerVPN-Mac"
         case .viscosity: return "com.viscosityvpn.Viscosity"
@@ -62,6 +64,7 @@ enum Client: String, CaseIterable {
     var appName: String {
         switch self {
         case .v2rayn: return "v2rayN"
+        case .bywave: return "ByWave"
         case .clash: return "Clash Verge"
         case .powervpn: return "PowerVPN"
         case .viscosity: return "Viscosity"
@@ -72,7 +75,8 @@ enum Client: String, CaseIterable {
 
     var processNeedles: [String] {
         switch self {
-        case .v2rayn: return ["/v2rayN.app/", "sing-box run"]
+        case .v2rayn: return ["/v2rayN.app/", "/Application Support/v2rayN/bin/"]
+        case .bywave: return ["/ByWave.app/Contents/MacOS/bywave", "/ByWave.app/Contents/MacOS/mihomo"]
         case .clash: return ["/Clash Verge.app/", "verge-mihomo"]
         case .powervpn: return ["/PowerVPN.app/"]
         case .viscosity: return ["/Viscosity.app/"]
@@ -84,11 +88,14 @@ enum Client: String, CaseIterable {
     var proxyPort: Int? {
         switch self {
         case .v2rayn: return 10808
+        case .bywave: return 7893
         case .clash: return 7897
         default: return nil
         }
     }
 }
+
+let managedLocalProxyPorts = Set(Client.allCases.compactMap(\.proxyPort))
 
 func matchesClientProcess(_ line: String, client: Client) -> Bool {
     if client == .hillstone {
@@ -333,6 +340,13 @@ func statusFor(_ client: Client, snapshot: Snapshot) -> (String, String) {
         if snapshot.v2Protected { return ("受保护", "TUN 正在接管网络，自动修复已暂停") }
         if running { return ("运行中", "未检测到 TUN 路由") }
         return ("已停止", "可以检查代理残留")
+    case .bywave:
+        if running {
+            if snapshot.proxyIsActive(client) { return ("运行中", "系统代理正在使用 7893") }
+            let tunHint = snapshot.utunRouteLines.isEmpty ? "TUN 状态请在应用内确认" : "检测到 utun 路由，可能正在使用 TUN"
+            return ("运行中", "系统代理未开启；\(tunHint)")
+        }
+        return ("已停止", "可以检查代理残留")
     case .clash:
         if running { return ("运行中", snapshot.proxyIsActive(client) ? "系统代理正在使用 7897" : "系统代理未开启") }
         return ("已停止", "可以检查代理残留")
@@ -379,7 +393,7 @@ func printStatus(_ snapshot: Snapshot) {
         let color = state == "已停止" ? ANSI.green : (state == "受保护" ? ANSI.cyan : ANSI.yellow)
         print(String(format: "%-14@ %-12@ %@", client.title as NSString, ANSI.paint(state, color) as NSString, advice as NSString))
     }
-    let relevant = snapshot.proxyEntries.filter { [10808, 7897].contains($0.port) && isLocalHost($0.host) }
+    let relevant = snapshot.proxyEntries.filter { managedLocalProxyPorts.contains($0.port) && isLocalHost($0.host) }
     print("\n系统代理残留：\(relevant.isEmpty ? ANSI.paint("无", ANSI.green) : ANSI.paint("\(relevant.count) 项", ANSI.yellow))")
     for entry in relevant { print("  \(entry.service): \(entry.type) \(entry.host):\(entry.port)") }
     print("虚拟网卡路由：\(snapshot.utunRouteLines.isEmpty ? ANSI.paint("无", ANSI.green) : ANSI.paint("正在接管网络", ANSI.yellow))")
@@ -504,6 +518,33 @@ func stopClient(_ client: Client, options: Set<String>) -> Bool {
             print(ANSI.paint("处理失败：v2rayN 未接受正常退出请求，网络未被工具改动。", ANSI.red))
             return false
         }
+    case .bywave:
+        guard options.contains("--confirm-bywave"), options.contains("--confirm-risk") else {
+            operation.finish(result: "拒绝", detail: "缺少双重风险确认", after: snapshot)
+            print(ANSI.paint("已拒绝：关闭 ByWave 可能中断当前 Codex 网络，必须完成双重确认。", ANSI.red))
+            return false
+        }
+        guard quitApplication(client) else {
+            operation.finish(result: "失败", detail: "无法请求应用正常退出")
+            print(ANSI.paint("处理失败：ByWave 未接受正常退出请求，网络未被工具改动。", ANSI.red))
+            return false
+        }
+        guard waitUntil(15, {
+            !processIsRunning(.bywave) && !effectiveSystemProxyUses(port: 7893)
+        }) else {
+            let processActive = processIsRunning(.bywave)
+            let proxyActive = effectiveSystemProxyUses(port: 7893)
+            operation.finish(
+                result: "部分完成",
+                detail: "进程=\(processActive ? "仍运行" : "已退出"); 7893系统代理=\(proxyActive ? "仍启用" : "已释放")"
+            )
+            print(ANSI.paint("部分完成：已请求退出 ByWave，但仍需检查\(processActive ? "应用进程" : "")\(processActive && proxyActive ? "和" : "")\(proxyActive ? " 7893 系统代理" : "")。", ANSI.yellow))
+            return false
+        }
+        let after = takeSnapshot()
+        operation.finish(result: "成功", detail: "应用进程已退出；7893 系统代理已释放；后台辅助服务未改动", after: after)
+        print(ANSI.paint("处理成功：ByWave 已退出，7893 系统代理已释放。", ANSI.green))
+        return true
     case .clash:
         guard quitApplication(client) else {
             operation.finish(result: "失败", detail: "无法请求应用正常退出")
@@ -625,7 +666,7 @@ func stopClient(_ client: Client, options: Set<String>) -> Bool {
 }
 
 func staleLocalProxyEntries(_ snapshot: Snapshot) -> [ProxyEntry] {
-    snapshot.proxyEntries.filter { [10808, 7897].contains($0.port) && isLocalHost($0.host) }
+    snapshot.proxyEntries.filter { managedLocalProxyPorts.contains($0.port) && isLocalHost($0.host) }
 }
 
 func activityBlockers(_ snapshot: Snapshot) -> [String] {
@@ -662,7 +703,7 @@ func repair(_ confirmed: Bool, automatic: Bool = false) -> Bool {
     }
     guard !stale.isEmpty else {
         log("修复检查 | 未发现受管本地代理残留")
-        if !automatic { print(ANSI.paint("检查完成：未发现 10808/7897 本地系统代理残留。", ANSI.green)) }
+        if !automatic { print(ANSI.paint("检查完成：未发现 10808/7893/7897 本地系统代理残留。", ANSI.green)) }
         return true
     }
     guard confirmed else {
@@ -833,6 +874,7 @@ func generateDiagnosticReport() -> URL? {
         Hillstone 连接状态：\(hillstoneStateLabel(snapshot.hillstoneConnectionState))
         Hillstone 后台服务：\(snapshot.hillstoneServiceRunning ? "待命" : "未运行")
         10808 监听：\(portIsListening(10808) ? "是" : "否")
+        7893 监听：\(portIsListening(7893) ? "是" : "否")
         7897 监听：\(portIsListening(7897) ? "是" : "否")
         utun 路由：\(snapshot.utunRouteLines.isEmpty ? "无" : "有（\(snapshot.utunRouteLines.count) 条，不记录内容）")
         其他 net-switch 进程：\(snapshot.otherNetSwitchProcesses.count)
@@ -1039,13 +1081,15 @@ func interactiveMenu() -> Never {
             if let client = chooseClient() { openClient(client); waitForMenu() }
         case "4":
             guard let client = chooseClient() else { continue }
-            if client == .v2rayn {
-                print(ANSI.paint("警告：关闭 v2rayN 会中断当前海外网络与 Codex 会话。", ANSI.red))
-                print("输入 关闭v2 确认：", terminator: "")
-                guard readLine() == "关闭v2" else { print("已取消。"); waitForMenu(); continue }
+            if client == .v2rayn || client == .bywave {
+                let keyword = client == .v2rayn ? "关闭v2" : "关闭ByWave"
+                print(ANSI.paint("警告：关闭 \(client.title) 可能中断当前海外网络与 Codex 会话。", ANSI.red))
+                print("输入 \(keyword) 确认：", terminator: "")
+                guard readLine() == keyword else { print("已取消。"); waitForMenu(); continue }
                 print("再次输入 确认 继续：", terminator: "")
                 guard readLine() == "确认" else { print("已取消。"); waitForMenu(); continue }
-                stopClient(client, options: ["--confirm-v2rayn", "--confirm-risk"])
+                let confirmation = client == .v2rayn ? "--confirm-v2rayn" : "--confirm-bywave"
+                stopClient(client, options: [confirmation, "--confirm-risk"])
             } else {
                 stopClient(client, options: [])
             }
@@ -1060,7 +1104,7 @@ func interactiveMenu() -> Never {
                 waitForMenu()
                 continue
             }
-            print("将只关闭 10808/7897 的本地系统代理。输入 清理 确认：", terminator: "")
+            print("将只关闭 10808/7893/7897 的本地系统代理。输入 清理 确认：", terminator: "")
             if readLine() == "清理" { repair(true) } else { print("已取消。") }
             waitForMenu()
         case "7":
