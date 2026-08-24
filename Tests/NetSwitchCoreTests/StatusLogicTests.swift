@@ -65,12 +65,13 @@ import Testing
 }
 
 @Test func sensitiveDiagnosticTextIsRedacted() {
-    let text = "demo://credential@example.invalid:443 contact@example.invalid /example/home/private"
+    let text = "demo://credential@example.invalid:443 contact@example.invalid /example/home/private [2409:8c02:248:101::d0]:443"
     let redacted = redactSensitiveText(text, homeDirectory: "/example/home")
 
     #expect(!redacted.contains("demo://"))
     #expect(!redacted.contains("contact@example.invalid"))
     #expect(!redacted.contains("/example/home"))
+    #expect(!redacted.contains("2409:8c02"))
 }
 
 @Test func hillstoneLatestLifecycleEventWins() {

@@ -78,6 +78,7 @@ public func redactSensitiveText(_ text: String, homeDirectory: String) -> String
     var value = text.replacingOccurrences(of: homeDirectory, with: "~")
     let patterns = [
         #"(?i)\b[a-z][a-z0-9+.-]*://\S+"#,
+        #"\[[0-9A-Fa-f:]*:[0-9A-Fa-f:]+\]"#,
         #"\b(?:\d{1,3}\.){3}\d{1,3}\b"#,
         #"\b[\w.%+-]+@[\w.-]+\.[A-Za-z]{2,}\b"#
     ]

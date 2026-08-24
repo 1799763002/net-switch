@@ -40,6 +40,7 @@ net 看           # show the current state once
 net 监看         # refresh the state every five seconds
 net 清理         # inspect safe-to-clean local proxy residue
 net 日志         # show recent events
+net clash日志    # show recent Clash Verge warnings, timeouts, and errors
 net 日志目录     # open the local log directory in Finder
 net 诊断         # create a redacted diagnostic report
 ```
@@ -59,7 +60,7 @@ Use one network owner at a time. Before switching, disconnect in the original cl
 Special handling:
 
 - **v2rayN**: an active TUN route is protected. The tool will not automatically exit it or clear network settings.
-- **ByWave**: recognizes local proxy port `7893` and its live TUN state; after one confirmation it disables TUN through the local Mihomo API before quitting, while leaving the root helper service untouched.
+- **ByWave**: recognizes local proxy port `7893` and its live TUN state; after one confirmation it disables TUN through the local Mihomo API before quitting, while leaving the root helper service untouched. An idle helper is reported as a stopped application instead of an active client.
 - **Clash Verge**: verifies that both the application and local proxy port `7897` are released on exit.
 - **Viscosity**: uses its AppleScript automation interface to disconnect connections before exiting.
 - **PowerVPN**: refuses to exit while the configured macOS VPN service remains connected.
@@ -72,7 +73,7 @@ Special handling:
 
 ## Logs and privacy
 
-Logs are local under `~/Library/Logs/net-switch/` and are retained for 30 days. Event logs track actions, duration, redacted before/after state, refusal reasons, and errors. `launchd.log` may remain empty because events are written to `events-YYYY-MM-DD.log`.
+Logs are local under `~/Library/Logs/net-switch/` and are retained for 30 days. Event logs track command invocations, menu selections, actions, duration, redacted before/after state, refusal reasons, and errors. `launchd.log` may remain empty because events are written to `events-YYYY-MM-DD.log`. Diagnostics also include a redacted extract of recent warnings and errors from Clash Verge's own persistent logs.
 
 `net 诊断` creates a redacted text report in the same directory. It reports only client names, high-level VPN state, proxy residue count, listening-port presence, guard state, and sanitized recent errors.
 

@@ -171,6 +171,7 @@ struct Snapshot {
     let tailscaleStatus: TailscaleStatus
     let hillstoneConnectionState: HillstoneConnectionState
     let hillstoneServiceRunning: Bool
+    let byWaveHelperRunning: Bool
     let byWaveTunEnabled: Bool
     let otherNetSwitchProcesses: [String]
 
@@ -409,6 +410,9 @@ func takeSnapshot() -> Snapshot {
         hillstoneServiceRunning: allProcesses.contains {
             $0.localizedCaseInsensitiveContains("HillstoneSecureConnectService")
         },
+        byWaveHelperRunning: allProcesses.contains {
+            $0.localizedCaseInsensitiveContains("/usr/local/bin/bywave-service")
+        },
         byWaveTunEnabled: byWaveTunIsEnabled(),
         otherNetSwitchProcesses: allProcesses.filter {
             ($0.contains("/net-switch") || $0.contains(".build/release/net-switch"))
@@ -436,7 +440,8 @@ func statusFor(_ client: Client, snapshot: Snapshot) -> (String, String) {
             let tunHint = snapshot.byWaveTunEnabled ? "ByWave TUN 正在接管网络" : "ByWave TUN 未启用"
             return ("运行中", "系统代理未开启；\(tunHint)")
         }
-        return ("已停止", "可以检查代理残留")
+        let helper = snapshot.byWaveHelperRunning ? "；后台辅助服务待命（未接管网络）" : ""
+        return ("已停止", "应用已退出\(helper)")
     case .clash:
         if running { return ("运行中", snapshot.proxyIsActive(client) ? "系统代理正在使用 7897" : "系统代理未开启") }
         return ("已停止", "可以检查代理残留")
@@ -968,6 +973,39 @@ func recentExceptionalLogLines(limit: Int) -> [String] {
     }.suffix(limit).map(sanitizedLogLine)
 }
 
+func clashLogsDirectory() -> URL {
+    FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/logs", isDirectory: true)
+}
+
+func recentClashExceptionalLogLines(limit: Int) -> [String] {
+    let directory = clashLogsDirectory()
+    let candidates = [
+        directory.appendingPathComponent("sidecar/sidecar_latest.log"),
+        directory.appendingPathComponent("latest.log")
+    ]
+    let markers = ["level=error", "level=warning", " error ", " warn ", "timeout", "deadline", "reset", "failed"]
+    return candidates.flatMap { file -> [String] in
+        guard let text = try? String(contentsOf: file, encoding: .utf8) else { return [] }
+        return text.split(separator: "\n").map(String.init).filter { line in
+            let lowered = line.lowercased()
+            return markers.contains { lowered.contains($0) }
+        }
+    }.suffix(limit).map(sanitizedLogLine)
+}
+
+func showRecentClashLogs() {
+    let lines = recentClashExceptionalLogLines(limit: 80)
+    print(ANSI.paint("Clash Verge 最近警告与错误（已脱敏）", ANSI.bold + ANSI.cyan))
+    if lines.isEmpty {
+        print("当前持久化日志中没有发现警告、超时或错误。")
+    } else {
+        lines.forEach { print($0) }
+    }
+    print("\n原始日志目录：\(clashLogsDirectory().path)")
+    log("操作 | 查看 Clash Verge 最近警告与错误 | 条数=\(lines.count)")
+}
+
 func guardProcessStatus() -> String {
     let result = Shell.run("/bin/launchctl", ["print", "gui/\(getuid())/local.net-switch.guard"])
     guard result.status == 0 else { return "未加载" }
@@ -991,6 +1029,7 @@ func generateDiagnosticReport() -> URL? {
         let file = directory.appendingPathComponent("diagnostic-\(timestamp.string(from: Date())).txt")
         let tailscale = snapshot.tailscaleStatus
         let recent = recentExceptionalLogLines(limit: 20)
+        let clashRecent = recentClashExceptionalLogLines(limit: 20)
         let report = """
         net-switch 脱敏诊断报告
         生成时间：\(ISO8601DateFormatter().string(from: Date()))
@@ -1003,6 +1042,7 @@ func generateDiagnosticReport() -> URL? {
         Tailscale 专属路由：\(tailscale.hasOwnedRoutes ? "有" : "无")
         Hillstone 连接状态：\(hillstoneStateLabel(snapshot.hillstoneConnectionState))
         Hillstone 后台服务：\(snapshot.hillstoneServiceRunning ? "待命" : "未运行")
+        ByWave 后台辅助服务：\(snapshot.byWaveHelperRunning ? "待命（未代表应用运行）" : "未运行")
         10808 监听：\(portIsListening(10808) ? "是" : "否")
         7893 监听：\(portIsListening(7893) ? "是" : "否")
         7897 监听：\(portIsListening(7897) ? "是" : "否")
@@ -1012,6 +1052,9 @@ func generateDiagnosticReport() -> URL? {
 
         最近异常（已脱敏）
         \(recent.isEmpty ? "无" : recent.joined(separator: "\n"))
+
+        Clash Verge 最近警告与错误（已脱敏）
+        \(clashRecent.isEmpty ? "无" : clashRecent.joined(separator: "\n"))
 
         隐私说明
         本报告不记录节点、订阅、账号、密码、服务器地址、完整路由表或完整命令输出。
@@ -1035,6 +1078,7 @@ func logsAndDiagnosticsMenu() {
   1. 查看最近日志    显示最近 80 条记录
   2. 打开日志目录    在 Finder 中打开隐藏目录
   3. 生成诊断报告    保存脱敏后的状态与最近异常
+  4. Clash 日志     显示 Clash Verge 最近警告与错误
   0. 返回
 """)
     print("请输入数字：", terminator: "")
@@ -1042,6 +1086,7 @@ func logsAndDiagnosticsMenu() {
     case "1": showRecentLogs()
     case "2": openLogsDirectory()
     case "3": _ = generateDiagnosticReport()
+    case "4": showRecentClashLogs()
     default: return
     }
 }
@@ -1271,6 +1316,7 @@ func usage() {
       net 监看       持续显示状态
       net 清理       检查可清理的代理残留（不会直接清理）
       net 日志       查看最近 80 条操作与异常记录
+      net clash日志  查看 Clash Verge 最近警告与错误
       net 日志目录   在 Finder 中打开日志目录
       net 诊断       生成不含账号和节点信息的脱敏报告
 
@@ -1281,6 +1327,13 @@ func usage() {
 }
 
 let arguments = Array(CommandLine.arguments.dropFirst())
+let safeAuditTokens = Set([
+    "status", "看", "状态", "watch", "监看", "guard", "start", "stop", "repair", "清理",
+    "日志", "clash日志", "日志目录", "诊断", "install", "uninstall", "help", "--help", "-h",
+    "--yes", "--confirm", "v2rayn", "bywave", "clash", "powervpn", "viscosity", "hillstone", "tailscale"
+])
+let auditedArguments = arguments.map { safeAuditTokens.contains($0) ? $0 : "[参数已省略]" }
+log("命令 | net\(auditedArguments.isEmpty ? "（交互菜单）" : " " + auditedArguments.joined(separator: " "))")
 guard let command = arguments.first else { interactiveMenu() }
 let options = Set(arguments.filter { $0.hasPrefix("--") })
 
@@ -1299,6 +1352,7 @@ case "stop":
 case "repair", "清理":
     if !repair(options.contains("--yes") || options.contains("--confirm")) { exit(1) }
 case "日志": showRecentLogs()
+case "clash日志": showRecentClashLogs()
 case "日志目录": openLogsDirectory()
 case "诊断": _ = generateDiagnosticReport()
 case "install": installAgent()
