@@ -137,12 +137,15 @@ enum Client: String, CaseIterable {
 
 let managedLocalProxyPorts = Set(Client.allCases.compactMap(\.proxyPort))
 
-func matchesClientProcess(_ line: String, client: Client) -> Bool {
+func isShellCommandLine(_ line: String) -> Bool {
     let command = line.trimmingCharacters(in: .whitespacesAndNewlines)
     let shellPrefixes = ["/bin/sh ", "/bin/zsh ", "/bin/bash ", "/usr/bin/env "]
-    if shellPrefixes.contains(where: { command.hasPrefix($0) }) {
-        return false
-    }
+    return shellPrefixes.contains(where: { command.hasPrefix($0) })
+}
+
+func matchesClientProcess(_ line: String, client: Client) -> Bool {
+    let command = line.trimmingCharacters(in: .whitespacesAndNewlines)
+    if isShellCommandLine(command) { return false }
     if client == .hillstone {
         return client.processNeedles.contains {
             command.localizedCaseInsensitiveContains($0)
@@ -410,6 +413,7 @@ func takeSnapshot() -> Snapshot {
         otherNetSwitchProcesses: allProcesses.filter {
             ($0.contains("/net-switch") || $0.contains(".build/release/net-switch"))
                 && !$0.hasSuffix("net-switch guard")
+                && !isShellCommandLine($0)
         }
     )
 }
