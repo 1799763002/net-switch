@@ -41,6 +41,9 @@ enum Shell {
         process.terminationHandler = { _ in finished.signal() }
         do {
             try process.run()
+            // Process keeps the parent's copy of the pipe writer open. Closing it here
+            // guarantees readDataToEndOfFile can observe EOF after the child exits.
+            try? pipe.fileHandleForWriting.close()
             if finished.wait(timeout: .now() + timeout) == .timedOut {
                 process.terminate()
                 if finished.wait(timeout: .now() + 0.5) == .timedOut {
@@ -135,13 +138,18 @@ enum Client: String, CaseIterable {
 let managedLocalProxyPorts = Set(Client.allCases.compactMap(\.proxyPort))
 
 func matchesClientProcess(_ line: String, client: Client) -> Bool {
+    let command = line.trimmingCharacters(in: .whitespacesAndNewlines)
+    let shellPrefixes = ["/bin/sh ", "/bin/zsh ", "/bin/bash ", "/usr/bin/env "]
+    if shellPrefixes.contains(where: { command.hasPrefix($0) }) {
+        return false
+    }
     if client == .hillstone {
         return client.processNeedles.contains {
-            line.localizedCaseInsensitiveContains($0)
-                && !line.localizedCaseInsensitiveContains("HillstoneSecureConnectService")
+            command.localizedCaseInsensitiveContains($0)
+                && !command.localizedCaseInsensitiveContains("HillstoneSecureConnectService")
         }
     }
-    return client.processNeedles.contains { line.localizedCaseInsensitiveContains($0) }
+    return client.processNeedles.contains { command.localizedCaseInsensitiveContains($0) }
 }
 
 struct ProxyEntry: Equatable {
@@ -215,6 +223,10 @@ struct Snapshot {
 
 func isLocalHost(_ host: String) -> Bool {
     ["127.0.0.1", "localhost", "::1"].contains(host.lowercased())
+}
+
+func proxyOwner(for entry: ProxyEntry) -> Client? {
+    Client.allCases.first { $0.proxyPort == entry.port }
 }
 
 func byWaveTunIsEnabled() -> Bool {
@@ -406,8 +418,10 @@ func statusFor(_ client: Client, snapshot: Snapshot) -> (String, String) {
     let running = snapshot.isRunning(client)
     switch client {
     case .v2rayn:
-        if snapshot.v2Protected { return ("受保护", "TUN 正在接管网络，自动修复已暂停") }
-        if running { return ("运行中", "未检测到 TUN 路由") }
+        if running {
+            let routeHint = snapshot.utunRouteLines.isEmpty ? "未检测到 TUN 路由" : "检测到 TUN 路由"
+            return ("运行中", routeHint)
+        }
         return ("已停止", "可以检查代理残留")
     case .bywave:
         if running {
@@ -462,14 +476,16 @@ func printStatus(_ snapshot: Snapshot) {
     print(String(repeating: "-", count: 78))
     for client in Client.allCases {
         let (state, advice) = statusFor(client, snapshot: snapshot)
-        let color = state == "已停止" ? ANSI.green : (state == "受保护" ? ANSI.cyan : ANSI.yellow)
+        let color = state == "已停止" ? ANSI.green : ANSI.yellow
         print(String(format: "%-14@ %-12@ %@", client.title as NSString, ANSI.paint(state, color) as NSString, advice as NSString))
     }
     let relevant = snapshot.proxyEntries.filter { managedLocalProxyPorts.contains($0.port) && isLocalHost($0.host) }
-    print("\n系统代理残留：\(relevant.isEmpty ? ANSI.paint("无", ANSI.green) : ANSI.paint("\(relevant.count) 项", ANSI.yellow))")
-    for entry in relevant { print("  \(entry.service): \(entry.type) \(entry.host):\(entry.port)") }
+    print("\n系统代理设置：\(relevant.isEmpty ? ANSI.paint("无", ANSI.green) : ANSI.paint("\(relevant.count) 项", ANSI.yellow))")
+    for entry in relevant {
+        let state = proxyOwner(for: entry).map { snapshot.isRunning($0) ? "正在使用" : "残留" } ?? "状态未知"
+        print("  \(entry.service): \(entry.type) \(entry.host):\(entry.port)（\(state)）")
+    }
     print("虚拟网卡路由：\(snapshot.utunRouteLines.isEmpty ? ANSI.paint("无", ANSI.green) : ANSI.paint("正在接管网络", ANSI.yellow))")
-    if snapshot.v2Protected { print(ANSI.paint("v2rayN 正在受保护运行：不会自动退出或清理网络。", ANSI.cyan)) }
     if !snapshot.otherNetSwitchProcesses.isEmpty {
         print(ANSI.paint("提示：检测到 \(snapshot.otherNetSwitchProcesses.count) 个其他 net-switch 进程，可能是未退出的菜单或清理命令。工具不会自动结束它们。", ANSI.yellow))
     }
@@ -481,7 +497,7 @@ func snapshotSummary(_ snapshot: Snapshot) -> String {
         effectiveVPNs: snapshot.effectiveVPNNames,
         proxyCount: staleLocalProxyEntries(snapshot).count,
         hasUtunRoutes: !snapshot.utunRouteLines.isEmpty,
-        v2Protected: snapshot.v2Protected
+        v2Protected: false
     )
 }
 
@@ -517,6 +533,27 @@ func processIsRunning(_ client: Client) -> Bool {
     commandLines("/bin/ps", ["ax", "-o", "command="]).contains {
         matchesClientProcess($0, client: client)
     }
+}
+
+func clientProcessIDs(_ client: Client) -> [pid_t] {
+    commandLines("/bin/ps", ["ax", "-o", "pid=,command="]).compactMap { row in
+        let parts = row.trimmingCharacters(in: .whitespaces)
+            .split(maxSplits: 1, whereSeparator: \.isWhitespace)
+        guard parts.count == 2,
+              let pid = pid_t(parts[0]),
+              pid != ProcessInfo.processInfo.processIdentifier,
+              matchesClientProcess(String(parts[1]), client: client) else { return nil }
+        return pid
+    }
+}
+
+func terminateClientProcesses(_ client: Client) -> Bool {
+    var processIDs = clientProcessIDs(client)
+    for pid in processIDs { _ = Darwin.kill(pid, SIGTERM) }
+    if waitUntil(5, { clientProcessIDs(client).isEmpty }) { return true }
+    processIDs = clientProcessIDs(client)
+    for pid in processIDs { _ = Darwin.kill(pid, SIGKILL) }
+    return waitUntil(2, { clientProcessIDs(client).isEmpty })
 }
 
 func effectiveSystemProxyUses(port: Int) -> Bool {
@@ -587,10 +624,13 @@ func stopClient(_ client: Client, options: Set<String>) -> Bool {
             print(ANSI.paint("已拒绝：关闭 v2rayN 可能中断当前网络，请使用 --yes 明确确认。", ANSI.red))
             return false
         }
-        guard quitApplication(client) else {
-            operation.finish(result: "失败", detail: "无法请求应用正常退出")
-            print(ANSI.paint("处理失败：v2rayN 未接受正常退出请求，网络未被工具改动。", ANSI.red))
-            return false
+        _ = quitApplication(client)
+        if !waitUntil(3, { !processIsRunning(.v2rayn) }) {
+            guard terminateClientProcesses(.v2rayn) else {
+                operation.finish(result: "失败", detail: "无法终止 v2rayN 残留进程")
+                print(ANSI.paint("处理失败：v2rayN 仍有残留进程，请在活动监视器中检查。", ANSI.red))
+                return false
+            }
         }
     case .bywave:
         let confirmed = options.contains("--yes")
@@ -773,15 +813,9 @@ func activityBlockers(_ snapshot: Snapshot) -> [String] {
 func repair(_ confirmed: Bool, automatic: Bool = false) -> Bool {
     let snapshot = takeSnapshot()
     let stale = staleLocalProxyEntries(snapshot)
-    if snapshot.hasActivity {
-        if !automatic { printStatus(snapshot) }
+    if automatic && snapshot.hasActivity {
         let blockers = activityBlockers(snapshot)
         log("修复拒绝 | \(blockers.joined(separator: "；")) | 状态=\(snapshotSummary(snapshot))")
-        if !automatic {
-            print(ANSI.paint("已拒绝：当前网络仍被使用，未执行任何修改。", ANSI.red))
-            blockers.forEach { print("  - \($0)") }
-            print("请先在对应软件内断开并安全退出，再重新检查。")
-        }
         return false
     }
     guard !stale.isEmpty else {
@@ -791,10 +825,19 @@ func repair(_ confirmed: Bool, automatic: Bool = false) -> Bool {
     }
     guard confirmed else {
         log("修复预检 | 发现 \(stale.count) 项受管本地代理残留，等待确认")
-        print(ANSI.paint("检查完成：发现以下可安全归属的本地代理残留：", ANSI.yellow))
+        print(ANSI.paint("检查完成：发现以下受管本地系统代理：", ANSI.yellow))
         for entry in stale { print("  \(entry.service): \(entry.type) \(entry.host):\(entry.port)") }
-        print("请从主菜单选择“清理代理残留”，并按提示确认。")
+        if snapshot.hasActivity {
+            print(ANSI.paint("提示：代理客户端仍在运行；强制清理后，客户端可能再次写入这些设置。", ANSI.yellow))
+        }
+        print("请从主菜单选择“强制清理系统代理”，并按提示确认。")
         return true
+    }
+    if snapshot.hasActivity {
+        log("强制修复 | 用户确认在客户端运行期间清理系统代理 | 状态=\(snapshotSummary(snapshot))")
+        if !automatic {
+            print(ANSI.paint("警告：正在强制清理系统代理，运行中的客户端可能再次写入设置。", ANSI.yellow))
+        }
     }
     log("修复开始 | 清理 \(stale.count) 项受管本地代理残留")
     let commands: [(String, String)] = [
@@ -1162,7 +1205,7 @@ func interactiveMenu() -> Never {
   3. 打开软件        只打开，不自动连接
   4. 安全退出软件    按软件规则断开并退出
   5. 检查代理残留    只查看，不改动网络
-  6. 清理代理残留    仅在全部软件停止后可执行
+  6. 强制清理系统代理 运行中也可执行，需 y/yes 确认
   7. 开机自动守护    安装后台检查与自动清理
   8. 日志与诊断      查看日志、打开目录或生成脱敏报告
   0. 退出助手
@@ -1190,13 +1233,7 @@ func interactiveMenu() -> Never {
             repair(false)
             waitForMenu()
         case "6":
-            let current = takeSnapshot()
-            if current.hasActivity {
-                repair(false)
-                waitForMenu()
-                continue
-            }
-            if confirmYesNo("将只关闭 10808/7893/7897 的本地系统代理，确定继续吗？") {
+            if confirmYesNo("将关闭 10808/7893/7897 的系统代理设置，即使客户端仍在运行也继续吗？") {
                 repair(true)
             } else { print("已取消。") }
             waitForMenu()

@@ -67,6 +67,8 @@ Special handling:
 - **Tailscale**: a stopped backend with no recognizable Tailscale route is treated as stopped even if a macOS network extension still appears attached.
 - External status probes have timeouts, so a stuck client command cannot block the `net` menu indefinitely.
 - Guard installation removes the legacy `com.chenlang.net-switch` job to prevent duplicate guard processes.
+- The force-clean action can disable managed HTTP, HTTPS, and SOCKS settings even while a client is running, after one `y/yes` confirmation.
+- v2rayN no longer has a special protected state; if normal quit leaves its core behind, the tool terminates that remaining process.
 
 ## Logs and privacy
 
