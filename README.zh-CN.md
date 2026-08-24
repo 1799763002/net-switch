@@ -72,6 +72,8 @@ swift test
 - **Viscosity**：先通过 AppleScript 断开连接，再退出应用；第一次使用可能要求 macOS 授予自动化权限。
 - **Hillstone Secure Connect**：本工具仅依据本机生命周期日志判断连接状态。连接中或状态不明时会拒绝退出；其厂商后台服务不会被停止，也不会被当作残留。
 - **Tailscale**：后端已经停止且没有可识别的 Tailscale 路由时，即使 macOS 网络扩展仍显示挂载，也视为已停止。
+- 外部状态探测均有超时保护；即使 Tailscale 或其他客户端命令异常，`net` 菜单也不会永久卡住。
+- 安装守护时会自动移除旧版 `com.chenlang.net-switch` 守护，避免重复进程和重复探测。
 
 ## 日志与隐私
 

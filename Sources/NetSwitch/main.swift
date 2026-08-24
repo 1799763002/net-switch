@@ -2,22 +2,59 @@ import Foundation
 import NetSwitchCore
 import Darwin
 
+final class CommandOutputBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+
+    func append(_ chunk: Data) {
+        lock.lock()
+        data.append(chunk)
+        lock.unlock()
+    }
+
+    func string() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+}
+
 enum Shell {
     @discardableResult
-    static func run(_ executable: String, _ arguments: [String] = []) -> (output: String, status: Int32) {
+    static func run(
+        _ executable: String,
+        _ arguments: [String] = [],
+        timeout: TimeInterval = 3
+    ) -> (output: String, status: Int32) {
         let process = Process()
         let pipe = Pipe()
+        let output = CommandOutputBuffer()
+        let finished = DispatchSemaphore(value: 0)
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
         process.standardOutput = pipe
         process.standardError = pipe
+        pipe.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            if !chunk.isEmpty { output.append(chunk) }
+        }
+        process.terminationHandler = { _ in finished.signal() }
         do {
             try process.run()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-            let output = String(data: data, encoding: .utf8) ?? ""
-            return (output, process.terminationStatus)
+            if finished.wait(timeout: .now() + timeout) == .timedOut {
+                process.terminate()
+                if finished.wait(timeout: .now() + 0.5) == .timedOut {
+                    Darwin.kill(process.processIdentifier, SIGKILL)
+                    _ = finished.wait(timeout: .now() + 0.5)
+                }
+                pipe.fileHandleForReading.readabilityHandler = nil
+                return (output.string() + "Command timed out after \(timeout) seconds\n", 124)
+            }
+            pipe.fileHandleForReading.readabilityHandler = nil
+            output.append(pipe.fileHandleForReading.readDataToEndOfFile())
+            return (output.string(), process.terminationStatus)
         } catch {
+            pipe.fileHandleForReading.readabilityHandler = nil
             return ("Unable to run \(executable): \(error.localizedDescription)", 127)
         }
     }
@@ -281,7 +318,7 @@ func viscosityStates(isRunning: Bool) -> [String] {
 }
 
 func tailscaleCLIStatus(serviceAttached: Bool, routeLines: [String]) -> TailscaleStatus {
-    let result = Shell.run("/usr/local/bin/tailscale", ["status", "--json"])
+    let result = Shell.run("/usr/local/bin/tailscale", ["status", "--json"], timeout: 1)
     guard result.status == 0,
           let data = result.output.data(using: .utf8),
           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -990,6 +1027,18 @@ func plistPath() -> URL {
     FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents/local.net-switch.guard.plist")
 }
 
+func legacyPlistPath() -> URL {
+    FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents/com.chenlang.net-switch.plist")
+}
+
+func removeLegacyAgentIfPresent() {
+    let legacyPath = legacyPlistPath()
+    guard FileManager.default.fileExists(atPath: legacyPath.path) else { return }
+    _ = Shell.run("/bin/launchctl", ["bootout", "gui/\(getuid())", legacyPath.path])
+    try? FileManager.default.removeItem(at: legacyPath)
+    log("守护迁移 | 已移除旧版 com.chenlang.net-switch，避免重复运行")
+}
+
 func installAgent() {
     let executable = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.path
     guard executable.hasPrefix("/") else { fail("Install requires an absolute path to the built net-switch executable.") }
@@ -1003,6 +1052,7 @@ func installAgent() {
         "StandardErrorPath": logsDirectory().appendingPathComponent("launchd.log").path
     ]
     do {
+        removeLegacyAgentIfPresent()
         try FileManager.default.createDirectory(at: logsDirectory(), withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
         let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
@@ -1018,6 +1068,7 @@ func installAgent() {
 func uninstallAgent() {
     let path = plistPath()
     _ = Shell.run("/bin/launchctl", ["bootout", "gui/\(getuid())", path.path])
+    removeLegacyAgentIfPresent()
     do {
         if FileManager.default.fileExists(atPath: path.path) { try FileManager.default.removeItem(at: path) }
         log("守护卸载 | 已移除登录后自动启动")

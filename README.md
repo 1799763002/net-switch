@@ -65,6 +65,8 @@ Special handling:
 - **PowerVPN**: refuses to exit while the configured macOS VPN service remains connected.
 - **Hillstone Secure Connect**: uses redacted local lifecycle state to decide whether a connection is active; its vendor background service is never stopped.
 - **Tailscale**: a stopped backend with no recognizable Tailscale route is treated as stopped even if a macOS network extension still appears attached.
+- External status probes have timeouts, so a stuck client command cannot block the `net` menu indefinitely.
+- Guard installation removes the legacy `com.chenlang.net-switch` job to prevent duplicate guard processes.
 
 ## Logs and privacy
 
