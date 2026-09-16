@@ -43,6 +43,11 @@ net 日志         # 查看最近事件
 net clash日志    # 查看 Clash Verge 最近警告、超时与错误
 net 日志目录     # 在 Finder 打开日志目录
 net 诊断         # 生成脱敏诊断报告
+net 模式         # 查看当前分流、兜底、直连或异常状态
+net 分流         # 国内直连，海外经 Clash + Tailscale 私网 VPS
+net 兜底         # 所有公网流量临时经 Tailscale Exit Node
+net 直连         # 取消代理，保留 Tailscale 私网连接
+net 网络诊断     # 比较默认路径和 Clash 7897 代理路径
 ```
 
 交互确认统一输入 `y` 或 `yes` 继续，输入 `n`、`no` 或直接回车取消。命令行危险操作可使用 `--yes`，例如 `net stop bywave --yes`。
@@ -73,6 +78,9 @@ swift test
 - **Viscosity**：先通过 AppleScript 断开连接，再退出应用；第一次使用可能要求 macOS 授予自动化权限。
 - **Hillstone Secure Connect**：本工具仅依据本机生命周期日志判断连接状态。连接中或状态不明时会拒绝退出；其厂商后台服务不会被停止，也不会被当作残留。
 - **Tailscale**：后端已经停止且没有可识别的 Tailscale 路由时，即使 macOS 网络扩展仍显示挂载，也视为已停止。
+- **模式切换**：分流模式保持 Tailscale 私网在线但取消 Exit Node；兜底模式关闭 Clash 系统代理后启用 Exit Node；直连模式保留 Tailnet 私网但不代理公网。切换前会预检，失败自动恢复此前 Exit Node、Clash 和系统代理状态。
+- **Tailscale 关闭保护**：取消 Exit Node 和关闭 Tailscale 是两个独立动作；彻底关闭必须使用一次 `y/yes` 确认。
+- **后台守护**：Tailscale 仅作为私网连接时不会阻止无主代理残留清理；模式切换期间通过事务锁暂停自动修复。
 - 外部状态探测均有超时保护；即使 Tailscale 或其他客户端命令异常，`net` 菜单也不会永久卡住。
 - 安装守护时会自动移除旧版 `com.chenlang.net-switch` 守护，避免重复进程和重复探测。
 - 菜单中的“强制清理系统代理”允许在客户端仍运行时关闭 10808/7893/7897 对应的 HTTP、HTTPS 和 SOCKS 设置；执行前只需一次 `y/yes` 确认。
@@ -86,7 +94,7 @@ swift test
 ~/Library/Logs/net-switch/
 ```
 
-日志保留 30 天，记录命令调用、菜单选择、操作编号、耗时、脱敏前后状态、拒绝原因和异常。主要事件文件为 `events-YYYY-MM-DD.log`；`launchd.log` 可能为空，这是正常情况。`net 诊断` 还会读取 Clash Verge 自带的持久化日志，摘录最近警告与错误并进行脱敏。
+日志保留 30 天，记录命令调用、菜单选择、模式切换、操作编号、耗时、脱敏前后状态、拒绝原因、回滚结果和异常。主要事件文件为 `events-YYYY-MM-DD.log`；`launchd.log` 可能为空，这是正常情况。`net 诊断` 只摘录 Clash Verge 最近 24 小时的警告与错误并进行脱敏，更早历史会明确省略。
 
 `net 诊断` 会在同一目录生成脱敏报告，仅包含客户端名称、概括性 VPN 状态、代理残留数量、端口是否监听、守护状态和已脱敏的近期异常。
 

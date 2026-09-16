@@ -43,6 +43,11 @@ net 日志         # show recent events
 net clash日志    # show recent Clash Verge warnings, timeouts, and errors
 net 日志目录     # open the local log directory in Finder
 net 诊断         # create a redacted diagnostic report
+net 模式         # show split, fallback, direct, conflict, or degraded mode
+net 分流         # direct CN traffic; proxy global traffic through Clash over Tailnet
+net 兜底         # temporarily route all public traffic through the Tailscale exit node
+net 直连         # disable public proxying while keeping Tailnet private access
+net 网络诊断     # compare the default path with the Clash 7897 path
 ```
 
 Interactive confirmations accept `y` or `yes`; `n`, `no`, and Enter cancel. For command-line use, pass `--yes`, for example `net stop bywave --yes`.
@@ -66,6 +71,9 @@ Special handling:
 - **PowerVPN**: refuses to exit while the configured macOS VPN service remains connected.
 - **Hillstone Secure Connect**: uses redacted local lifecycle state to decide whether a connection is active; its vendor background service is never stopped.
 - **Tailscale**: a stopped backend with no recognizable Tailscale route is treated as stopped even if a macOS network extension still appears attached.
+- **Network modes**: split mode keeps the Tailnet connected without an exit node, fallback mode uses the `vps-2026` exit node, and direct mode keeps private Tailnet access without public proxying. Failed transitions restore the previous exit-node, Clash, and proxy state.
+- **Tailscale shutdown protection**: clearing an exit node is separate from taking Tailscale down; a full shutdown always requires `y/yes` or `--yes`.
+- **Guard behavior**: a mesh-only Tailscale connection no longer prevents stale local proxy cleanup, and automatic repair pauses while a mode transition lock exists.
 - External status probes have timeouts, so a stuck client command cannot block the `net` menu indefinitely.
 - Guard installation removes the legacy `com.chenlang.net-switch` job to prevent duplicate guard processes.
 - The force-clean action can disable managed HTTP, HTTPS, and SOCKS settings even while a client is running, after one `y/yes` confirmation.
@@ -73,7 +81,7 @@ Special handling:
 
 ## Logs and privacy
 
-Logs are local under `~/Library/Logs/net-switch/` and are retained for 30 days. Event logs track command invocations, menu selections, actions, duration, redacted before/after state, refusal reasons, and errors. `launchd.log` may remain empty because events are written to `events-YYYY-MM-DD.log`. Diagnostics also include a redacted extract of recent warnings and errors from Clash Verge's own persistent logs.
+Logs are local under `~/Library/Logs/net-switch/` and are retained for 30 days. Event logs track command invocations, menu selections, mode changes, duration, redacted before/after state, rollback results, refusal reasons, and errors. `launchd.log` may remain empty because events are written to `events-YYYY-MM-DD.log`. Diagnostics include only the last 24 hours of redacted Clash Verge warnings and errors and label older history as omitted.
 
 `net 诊断` creates a redacted text report in the same directory. It reports only client names, high-level VPN state, proxy residue count, listening-port presence, guard state, and sanitized recent errors.
 

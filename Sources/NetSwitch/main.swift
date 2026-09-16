@@ -136,6 +136,9 @@ enum Client: String, CaseIterable {
 }
 
 let managedLocalProxyPorts = Set(Client.allCases.compactMap(\.proxyPort))
+let splitVPSAddress = "100.110.219.72"
+let splitVPSName = "vps-2026"
+let clashProxyPort = 7897
 
 func isShellCommandLine(_ line: String) -> Bool {
     let command = line.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -189,12 +192,27 @@ struct Snapshot {
             .filter { $0 != .tailscale }
             .contains { isRunning($0) }
         let effectiveVPN = connectedVPNs.contains { !$0.localizedCaseInsensitiveContains("Tailscale") }
-            || tailscaleStatus.isEffectivelyActive
+            || tailscaleStatus.usingExitNode
         return nonTailscaleProcess
             || effectiveVPN
             || hillstoneConnectionState == .connected
-            || !utunRouteLines.isEmpty
             || hasActiveViscosityConnection
+    }
+
+    var hasOtherNetworkOwner: Bool {
+        Client.allCases.filter { $0 != .tailscale && $0 != .clash }.contains { isRunning($0) }
+            || connectedVPNs.contains { !$0.localizedCaseInsensitiveContains("Tailscale") }
+            || hasActiveViscosityConnection
+            || hillstoneConnectionState == .connected
+    }
+
+    var networkMode: NetworkMode {
+        inferNetworkMode(
+            tailscale: tailscaleStatus,
+            clashRunning: isRunning(.clash),
+            clashProxyActive: effectiveSystemProxyUses(port: clashProxyPort),
+            hasOtherNetworkOwner: hasOtherNetworkOwner
+        )
     }
 
     var v2Protected: Bool {
@@ -334,10 +352,16 @@ func viscosityStates(isRunning: Bool) -> [String] {
 }
 
 func tailscaleCLIStatus(serviceAttached: Bool, routeLines: [String]) -> TailscaleStatus {
-    let result = Shell.run("/usr/local/bin/tailscale", ["status", "--json"], timeout: 1)
+    let result = Shell.run("/usr/local/bin/tailscale", ["status", "--json"], timeout: 2)
+    let preferences = Shell.run("/usr/local/bin/tailscale", ["debug", "prefs"], timeout: 2)
     guard result.status == 0,
           let data = result.output.data(using: .utf8),
-          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+          let parsed = parseTailscaleStatus(
+            statusData: data,
+            preferencesData: preferences.status == 0 ? preferences.output.data(using: .utf8) : nil,
+            serviceAttached: serviceAttached,
+            hasOwnedRoutes: hasTailscaleOwnedRoutes(routeLines)
+          ) else {
         return TailscaleStatus(
             backendState: nil,
             active: false,
@@ -345,12 +369,7 @@ func tailscaleCLIStatus(serviceAttached: Bool, routeLines: [String]) -> Tailscal
             hasOwnedRoutes: hasTailscaleOwnedRoutes(routeLines)
         )
     }
-    return TailscaleStatus(
-        backendState: object["BackendState"] as? String,
-        active: object["Active"] as? Bool ?? false,
-        serviceAttached: serviceAttached,
-        hasOwnedRoutes: hasTailscaleOwnedRoutes(routeLines)
-    )
+    return parsed
 }
 
 func hasTailscaleOwnedRoutes(_ routeLines: [String]) -> Bool {
@@ -470,7 +489,26 @@ func statusFor(_ client: Client, snapshot: Snapshot) -> (String, String) {
             return ("已停止", "后端已停止；macOS 网络扩展仍挂载，不影响后续切换")
         }
         if status.isEffectivelyActive {
-            return ("已连接", "Tailscale 后端或专属路由正在使用")
+            if status.usingExitNode {
+                let online = status.exitNodeOnline == false ? "离线" : "在线"
+                let path: String
+                switch status.connectionPath {
+                case .direct: path = "直连"
+                case .relay: path = "DERP 中继 \(status.relayRegion ?? "未知")"
+                case .unknown: path = "路径未知"
+                }
+                let lan = status.exitNodeAllowLANAccess ? "允许局域网" : "不允许局域网"
+                return ("全局出口", "\(status.exitNodeName ?? "未知节点") \(online)，\(path)，\(lan)")
+            }
+            let peer = status.peerName ?? "目标节点"
+            let online = status.peerOnline == false ? "离线" : "在线"
+            let path: String
+            switch status.connectionPath {
+            case .direct: path = "直连"
+            case .relay: path = "DERP 中继 \(status.relayRegion ?? "未知")"
+            case .unknown: path = "路径未知"
+            }
+            return ("已连接", "仅 Tailnet 私网；\(peer) \(online)，\(path)")
         }
         if status.backendState == nil, status.serviceAttached {
             return ("需检查", "无法读取 Tailscale 后端状态，暂按活动连接保护")
@@ -495,6 +533,8 @@ func printStatus(_ snapshot: Snapshot) {
         print("  \(entry.service): \(entry.type) \(entry.host):\(entry.port)（\(state)）")
     }
     print("虚拟网卡路由：\(snapshot.utunRouteLines.isEmpty ? ANSI.paint("无", ANSI.green) : ANSI.paint("正在接管网络", ANSI.yellow))")
+    let modeColor = [.conflict, .degraded].contains(snapshot.networkMode) ? ANSI.red : ANSI.cyan
+    print("当前网络模式：\(ANSI.paint(snapshot.networkMode.chineseLabel, modeColor))")
     if !snapshot.otherNetSwitchProcesses.isEmpty {
         print(ANSI.paint("提示：检测到 \(snapshot.otherNetSwitchProcesses.count) 个其他 net-switch 进程，可能是未退出的菜单或清理命令。工具不会自动结束它们。", ANSI.yellow))
     }
@@ -760,6 +800,14 @@ func stopClient(_ client: Client, options: Set<String>) -> Bool {
         print(ANSI.paint("处理成功：Hillstone 已断开并退出，系统后台服务保持待命。", ANSI.green))
         return true
     case .tailscale:
+        guard options.contains("--yes") else {
+            let exitHint = snapshot.tailscaleStatus.usingExitNode
+                ? "当前正在使用 Exit Node，关闭后海外网络可能立即中断。"
+                : "关闭后 FinalShell 的 Tailscale 私网连接将不可用。"
+            operation.finish(result: "拒绝", detail: "缺少确认", after: snapshot)
+            print(ANSI.paint("已拒绝：\(exitHint) 请使用 --yes 明确确认。", ANSI.red))
+            return false
+        }
         let result = Shell.run("/usr/local/bin/tailscale", ["down"])
         guard result.status == 0 else {
             operation.finish(result: "失败", detail: "官方断开命令执行失败")
@@ -809,10 +857,13 @@ func activityBlockers(_ snapshot: Snapshot) -> [String] {
     if !activeClients.isEmpty {
         blockers.append("运行中的客户端：\(activeClients.joined(separator: "、"))")
     }
-    if !snapshot.effectiveVPNNames.isEmpty {
-        blockers.append("活动 VPN：\(snapshot.effectiveVPNNames.joined(separator: "、"))")
+    let nonMeshVPNs = snapshot.effectiveVPNNames.filter {
+        $0 != "Tailscale" || snapshot.tailscaleStatus.usingExitNode
     }
-    if !snapshot.utunRouteLines.isEmpty {
+    if !nonMeshVPNs.isEmpty {
+        blockers.append("活动 VPN：\(nonMeshVPNs.joined(separator: "、"))")
+    }
+    if !snapshot.utunRouteLines.isEmpty && (snapshot.hasOtherNetworkOwner || snapshot.tailscaleStatus.usingExitNode) {
         blockers.append("仍有 utun 虚拟网卡路由")
     }
     return blockers
@@ -869,6 +920,246 @@ func repair(_ confirmed: Bool, automatic: Bool = false) -> Bool {
         print(ANSI.paint("处理失败：部分本地代理未能关闭，请运行“net 诊断”收集信息。", ANSI.red))
         return false
     }
+}
+
+struct ModeSnapshot {
+    let exitNodeName: String?
+    let exitNodeAllowLANAccess: Bool
+    let clashRunning: Bool
+    let proxyEntries: [ProxyEntry]
+}
+
+func transitionLockURL() -> URL {
+    logsDirectory().appendingPathComponent("mode-transition.lock")
+}
+
+func setTransitionLock(_ enabled: Bool) {
+    let file = transitionLockURL()
+    if enabled {
+        try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? Data("\(ProcessInfo.processInfo.processIdentifier)\n".utf8).write(to: file, options: .atomic)
+    } else {
+        try? FileManager.default.removeItem(at: file)
+    }
+}
+
+func transitionIsActive() -> Bool {
+    let file = transitionLockURL()
+    guard FileManager.default.fileExists(atPath: file.path) else { return false }
+    guard let text = try? String(contentsOf: file, encoding: .utf8),
+          let pid = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)),
+          Darwin.kill(pid, 0) == 0 else {
+        try? FileManager.default.removeItem(at: file)
+        return false
+    }
+    return true
+}
+
+func proxyStateCommand(for type: String) -> String? {
+    ["HTTP": "-setwebproxystate", "HTTPS": "-setsecurewebproxystate", "SOCKS": "-setsocksfirewallproxystate"][type]
+}
+
+func proxySetCommand(for type: String) -> String? {
+    ["HTTP": "-setwebproxy", "HTTPS": "-setsecurewebproxy", "SOCKS": "-setsocksfirewallproxy"][type]
+}
+
+@discardableResult
+func disableManagedProxy(port: Int) -> Bool {
+    let entries = currentProxyEntries().filter { $0.port == port && isLocalHost($0.host) }
+    return entries.allSatisfy { entry in
+        guard let command = proxyStateCommand(for: entry.type) else { return false }
+        return Shell.run("/usr/sbin/networksetup", [command, entry.service, "off"]).status == 0
+    }
+}
+
+@discardableResult
+func enableSystemProxy(port: Int) -> Bool {
+    var success = true
+    for service in networkServices() {
+        for type in ["HTTP", "HTTPS", "SOCKS"] {
+            guard let set = proxySetCommand(for: type), let state = proxyStateCommand(for: type) else { continue }
+            let configured = Shell.run("/usr/sbin/networksetup", [set, service, "127.0.0.1", "\(port)"]).status == 0
+            let enabled = configured && Shell.run("/usr/sbin/networksetup", [state, service, "on"]).status == 0
+            success = success && enabled
+        }
+    }
+    return success
+}
+
+func restoreProxyEntries(_ entries: [ProxyEntry]) {
+    for port in managedLocalProxyPorts { _ = disableManagedProxy(port: port) }
+    for entry in entries {
+        guard let set = proxySetCommand(for: entry.type), let state = proxyStateCommand(for: entry.type) else { continue }
+        _ = Shell.run("/usr/sbin/networksetup", [set, entry.service, entry.host, "\(entry.port)"])
+        _ = Shell.run("/usr/sbin/networksetup", [state, entry.service, "on"])
+    }
+}
+
+func tailscaleSetExitNode(_ name: String?, allowLAN: Bool = true) -> Bool {
+    let value = name.map { "--exit-node=\($0)" } ?? "--exit-node="
+    let result = Shell.run("/usr/local/bin/tailscale", ["set", value, "--exit-node-allow-lan-access=\(allowLAN ? "true" : "false")"], timeout: 10)
+    if result.status != 0 { log("模式切换步骤失败 | Tailscale Exit Node 更新失败") }
+    return result.status == 0
+}
+
+func tcpReachable(host: String, port: Int) -> Bool {
+    Shell.run("/usr/bin/nc", ["-G", "4", "-z", host, "\(port)"], timeout: 5).status == 0
+}
+
+func curlProbe(_ url: String, proxyPort: Int? = nil) -> (ok: Bool, summary: String) {
+    var arguments = ["-sS", "-L", "--max-time", "10", "-o", "/dev/null", "-w", "%{http_code} %{time_total}"]
+    if let proxyPort {
+        arguments += ["--proxy", "http://127.0.0.1:\(proxyPort)"]
+    } else {
+        arguments += ["--noproxy", "*"]
+    }
+    arguments.append(url)
+    let result = Shell.run("/usr/bin/curl", arguments, timeout: 12)
+    let value = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+    let code = Int(value.split(separator: " ").first ?? "0") ?? 0
+    return (result.status == 0 && code >= 200 && code < 500, value.isEmpty ? "失败" : value)
+}
+
+func curlProbeSucceeds(_ url: String, proxyPort: Int? = nil, attempts: Int = 3) -> Bool {
+    for attempt in 1...attempts {
+        if curlProbe(url, proxyPort: proxyPort).ok { return true }
+        if attempt < attempts { Thread.sleep(forTimeInterval: 1) }
+    }
+    return false
+}
+
+func captureModeSnapshot() -> ModeSnapshot {
+    let snapshot = takeSnapshot()
+    return ModeSnapshot(
+        exitNodeName: snapshot.tailscaleStatus.exitNodeName,
+        exitNodeAllowLANAccess: snapshot.tailscaleStatus.exitNodeAllowLANAccess,
+        clashRunning: snapshot.isRunning(.clash),
+        proxyEntries: snapshot.proxyEntries.filter { managedLocalProxyPorts.contains($0.port) && isLocalHost($0.host) }
+    )
+}
+
+func restoreModeSnapshot(_ saved: ModeSnapshot) {
+    _ = tailscaleSetExitNode(saved.exitNodeName, allowLAN: saved.exitNodeAllowLANAccess)
+    if saved.clashRunning && !processIsRunning(.clash) {
+        _ = Shell.run("/usr/bin/open", ["-b", Client.clash.bundleID])
+        _ = waitUntil(10) { portIsListening(clashProxyPort) }
+    } else if !saved.clashRunning && processIsRunning(.clash) {
+        _ = quitApplication(.clash)
+        _ = waitUntil(10) { !processIsRunning(.clash) }
+    }
+    restoreProxyEntries(saved.proxyEntries)
+}
+
+func printModeStatus(_ snapshot: Snapshot = takeSnapshot()) {
+    let mode = snapshot.networkMode
+    print(ANSI.paint("当前网络模式：\(mode.chineseLabel)", [.conflict, .degraded].contains(mode) ? ANSI.red : ANSI.cyan))
+    if snapshot.tailscaleStatus.usingExitNode {
+        print("Tailscale Exit Node：\(snapshot.tailscaleStatus.exitNodeName ?? "未知")")
+    } else {
+        print("Tailscale Exit Node：未启用（仅 Tailnet 私网）")
+    }
+    print("Clash 系统代理：\(effectiveSystemProxyUses(port: clashProxyPort) ? "127.0.0.1:\(clashProxyPort)" : "未启用")")
+}
+
+@discardableResult
+func changeNetworkMode(_ target: NetworkMode, confirmed: Bool) -> Bool {
+    guard [.split, .fallback, .direct].contains(target) else { return false }
+    guard confirmed else {
+        print(ANSI.paint("此操作会改变当前网络路径。请交互输入 y/yes，或在命令末尾添加 --yes。", ANSI.yellow))
+        guard confirmYesNo("切换到\(target.chineseLabel)模式吗？") else { print("已取消。"); return false }
+        return changeNetworkMode(target, confirmed: true)
+    }
+    let before = takeSnapshot()
+    let operation = OperationContext("切换到\(target.chineseLabel)模式", snapshot: before)
+    let saved = captureModeSnapshot()
+    setTransitionLock(true)
+    defer { setTransitionLock(false) }
+
+    func rollback(_ reason: String) -> Bool {
+        log("模式切换失败 | 编号=\(operation.id) | 原因=\(reason) | 开始回滚")
+        restoreModeSnapshot(saved)
+        let after = takeSnapshot()
+        operation.finish(result: "失败", detail: "\(reason)；已执行回滚", after: after)
+        print(ANSI.paint("切换失败：\(reason)。已恢复操作前的网络状态。", ANSI.red))
+        return false
+    }
+
+    switch target {
+    case .split:
+        guard before.tailscaleStatus.isEffectivelyActive else { return rollback("Tailscale 尚未连接") }
+        guard !before.hasOtherNetworkOwner else { return rollback("检测到 Clash 之外的其他网络客户端") }
+        let reachablePorts = [443, 9443, 22].filter { tcpReachable(host: splitVPSAddress, port: $0) }
+        guard !reachablePorts.isEmpty else { return rollback("Tailscale 私网 AnyTLS、VLESS 和 SSH 端口均不可达") }
+        if !processIsRunning(.clash) {
+            guard Shell.run("/usr/bin/open", ["-b", Client.clash.bundleID]).status == 0 else { return rollback("无法启动 Clash Verge") }
+        }
+        guard waitUntil(15, { portIsListening(clashProxyPort) }) else { return rollback("Clash 本地 7897 端口没有监听") }
+        guard curlProbeSucceeds("https://www.google.com/generate_204", proxyPort: clashProxyPort) else {
+            return rollback("取消 Exit Node 前的 Clash 海外预检失败")
+        }
+        guard tailscaleSetExitNode(nil), waitUntil(12, { !lightweightTailscaleStatus().usingExitNode }) else {
+            return rollback("无法取消 Tailscale Exit Node")
+        }
+        guard enableSystemProxy(port: clashProxyPort), effectiveSystemProxyUses(port: clashProxyPort) else {
+            return rollback("无法启用 Clash 系统代理")
+        }
+        guard curlProbeSucceeds("https://www.baidu.com", attempts: 2) else { return rollback("国内直连检查失败") }
+        guard curlProbeSucceeds("https://www.google.com/generate_204", proxyPort: clashProxyPort) else {
+            return rollback("海外代理检查失败")
+        }
+    case .fallback:
+        if processIsRunning(.clash) {
+            guard quitApplication(.clash), waitUntil(15, { !processIsRunning(.clash) }) else {
+                return rollback("Clash Verge 未能安全退出")
+            }
+        }
+        guard disableManagedProxy(port: clashProxyPort) else { return rollback("无法释放 Clash 系统代理") }
+        guard tailscaleSetExitNode(splitVPSName), waitUntil(12, { lightweightTailscaleStatus().usingExitNode }) else {
+            return rollback("无法启用 vps-2026 Exit Node")
+        }
+        guard curlProbeSucceeds("https://www.google.com/generate_204") else { return rollback("Exit Node 海外连通检查失败") }
+    case .direct:
+        if processIsRunning(.clash) {
+            guard quitApplication(.clash), waitUntil(15, { !processIsRunning(.clash) }) else {
+                return rollback("Clash Verge 未能安全退出")
+            }
+        }
+        guard disableManagedProxy(port: clashProxyPort) else { return rollback("无法释放 Clash 系统代理") }
+        guard tailscaleSetExitNode(nil), waitUntil(12, { !lightweightTailscaleStatus().usingExitNode }) else {
+            return rollback("无法取消 Tailscale Exit Node")
+        }
+        guard curlProbe("https://www.baidu.com").ok else { return rollback("本地直连检查失败") }
+    default: return false
+    }
+    let after = takeSnapshot()
+    guard after.networkMode == target else { return rollback("状态复核得到\(after.networkMode.chineseLabel)而非\(target.chineseLabel)") }
+    operation.finish(result: "成功", detail: "模式=\(target.chineseLabel)", after: after)
+    print(ANSI.paint("处理成功：已切换到\(target.chineseLabel)模式。", ANSI.green))
+    printModeStatus(after)
+    return true
+}
+
+func networkDiagnostic() {
+    let snapshot = takeSnapshot()
+    print(ANSI.paint("网络路径诊断（只读）", ANSI.bold + ANSI.cyan))
+    printModeStatus(snapshot)
+    print("Tailscale 私网 443：\(tcpReachable(host: splitVPSAddress, port: 443) ? "可达" : "不可达")")
+    print("Tailscale 私网 SSH：\(tcpReachable(host: splitVPSAddress, port: 22) ? "可达" : "不可达")")
+    let directCN = curlProbe("https://www.baidu.com")
+    let directGlobal = curlProbe("https://www.google.com/generate_204")
+    print("默认路径 / 百度：\(directCN.ok ? "成功" : "失败")（\(directCN.summary)）")
+    print("默认路径 / Google：\(directGlobal.ok ? "成功" : "失败")（\(directGlobal.summary)）")
+    if portIsListening(clashProxyPort) {
+        let proxyGlobal = curlProbe("https://www.google.com/generate_204", proxyPort: clashProxyPort)
+        let proxyChatGPT = curlProbe("https://chatgpt.com", proxyPort: clashProxyPort)
+        print("Clash 7897 / Google：\(proxyGlobal.ok ? "成功" : "失败")（\(proxyGlobal.summary)）")
+        print("Clash 7897 / ChatGPT：\(proxyChatGPT.ok ? "成功" : "失败")（\(proxyChatGPT.summary)）")
+    } else {
+        print("Clash 7897：未监听，跳过代理路径测试")
+    }
+    let dns = Shell.run("/usr/bin/dscacheutil", ["-q", "host", "-a", "name", "chatgpt.com"], timeout: 5)
+    print("DNS / chatgpt.com：\(dns.status == 0 && !dns.output.isEmpty ? "成功" : "失败")")
+    log("操作 | 网络路径诊断 | 模式=\(snapshot.networkMode.chineseLabel) | 国内=\(directCN.ok ? "成功" : "失败") | 默认海外=\(directGlobal.ok ? "成功" : "失败") | Clash监听=\(portIsListening(clashProxyPort) ? "是" : "否")")
 }
 
 func logsDirectory() -> URL {
@@ -989,21 +1280,22 @@ func recentClashExceptionalLogLines(limit: Int) -> [String] {
         guard let text = try? String(contentsOf: file, encoding: .utf8) else { return [] }
         return text.split(separator: "\n").map(String.init).filter { line in
             let lowered = line.lowercased()
-            return markers.contains { lowered.contains($0) }
+            return logLineIsWithin(line, hours: 24)
+                && markers.contains { lowered.contains($0) }
         }
     }.suffix(limit).map(sanitizedLogLine)
 }
 
 func showRecentClashLogs() {
     let lines = recentClashExceptionalLogLines(limit: 80)
-    print(ANSI.paint("Clash Verge 最近警告与错误（已脱敏）", ANSI.bold + ANSI.cyan))
+    print(ANSI.paint("Clash Verge 最近 24 小时警告与错误（已脱敏）", ANSI.bold + ANSI.cyan))
     if lines.isEmpty {
         print("当前持久化日志中没有发现警告、超时或错误。")
     } else {
         lines.forEach { print($0) }
     }
-    print("\n原始日志目录：\(clashLogsDirectory().path)")
-    log("操作 | 查看 Clash Verge 最近警告与错误 | 条数=\(lines.count)")
+    print("\n更早的历史记录已省略。原始日志目录：\(clashLogsDirectory().path)")
+    log("操作 | 查看 Clash Verge 最近 24 小时警告与错误 | 条数=\(lines.count)")
 }
 
 func guardProcessStatus() -> String {
@@ -1040,6 +1332,12 @@ func generateDiagnosticReport() -> URL? {
         Tailscale 有效活动：\(tailscale.isEffectivelyActive ? "是" : "否")
         Tailscale 网络扩展挂载：\(tailscale.serviceAttached ? "是" : "否")
         Tailscale 专属路由：\(tailscale.hasOwnedRoutes ? "有" : "无")
+        Tailscale Exit Node：\(tailscale.usingExitNode ? "已启用（\(tailscale.exitNodeName ?? "未知")）" : "未启用")
+        Tailscale Exit Node 在线：\(tailscale.exitNodeOnline.map { $0 ? "是" : "否" } ?? "不适用")
+        Tailscale 目标节点：\(tailscale.peerName ?? "未知")（\(tailscale.peerOnline.map { $0 ? "在线" : "离线" } ?? "未知")）
+        Tailscale 连接路径：\(tailscale.connectionPath.rawValue)\(tailscale.relayRegion.map { "（\($0)）" } ?? "")
+        Tailscale 允许局域网：\(tailscale.exitNodeAllowLANAccess ? "是" : "否")
+        当前网络模式：\(snapshot.networkMode.chineseLabel)
         Hillstone 连接状态：\(hillstoneStateLabel(snapshot.hillstoneConnectionState))
         Hillstone 后台服务：\(snapshot.hillstoneServiceRunning ? "待命" : "未运行")
         ByWave 后台辅助服务：\(snapshot.byWaveHelperRunning ? "待命（未代表应用运行）" : "未运行")
@@ -1053,7 +1351,7 @@ func generateDiagnosticReport() -> URL? {
         最近异常（已脱敏）
         \(recent.isEmpty ? "无" : recent.joined(separator: "\n"))
 
-        Clash Verge 最近警告与错误（已脱敏）
+        Clash Verge 最近 24 小时警告与错误（已脱敏；更早历史已省略）
         \(clashRecent.isEmpty ? "无" : clashRecent.joined(separator: "\n"))
 
         隐私说明
@@ -1096,6 +1394,11 @@ func guardLoop() -> Never {
     var quietSince: Date?
     var lastSummary = ""
     while true {
+        if transitionIsActive() {
+            quietSince = nil
+            Thread.sleep(forTimeInterval: 2)
+            continue
+        }
         let snapshot = takeSnapshot()
         let summary = snapshotSummary(snapshot)
         if summary != lastSummary { log("守护状态 | \(summary)"); lastSummary = summary }
@@ -1241,6 +1544,26 @@ func chooseClient() -> Client? {
     return Client.allCases[index - 1]
 }
 
+func networkModeMenu() {
+    print("""
+
+网络模式：
+  1. 分流    国内直连，海外经 Clash + Tailscale 私网 VPS
+  2. 兜底    所有公网流量经 Tailscale Exit Node
+  3. 直连    本地公网直连，Tailscale 仅保留私网连接
+  4. 查看    只显示当前模式
+  0. 返回
+""")
+    print("请输入数字：", terminator: "")
+    switch readLine()?.trimmingCharacters(in: .whitespacesAndNewlines) {
+    case "1": _ = changeNetworkMode(.split, confirmed: false)
+    case "2": _ = changeNetworkMode(.fallback, confirmed: false)
+    case "3": _ = changeNetworkMode(.direct, confirmed: false)
+    case "4": printModeStatus()
+    default: return
+    }
+}
+
 func interactiveMenu() -> Never {
     while true {
         print("\u{001B}[2J\u{001B}[H", terminator: "")
@@ -1257,6 +1580,7 @@ func interactiveMenu() -> Never {
   6. 强制清理系统代理 运行中也可执行，需 y/yes 确认
   7. 开机自动守护    安装后台检查与自动清理
   8. 日志与诊断      查看日志、打开目录或生成脱敏报告
+  9. 网络模式        分流、兜底、直连与当前状态
   0. 退出助手
 """)
         print("请输入数字：", terminator: "")
@@ -1270,7 +1594,7 @@ func interactiveMenu() -> Never {
             if let client = chooseClient() { openClient(client); waitForMenu() }
         case "4":
             guard let client = chooseClient() else { continue }
-            if client == .v2rayn || client == .bywave {
+            if client == .v2rayn || client == .bywave || client == .tailscale {
                 print(ANSI.paint("警告：关闭 \(client.title) 可能中断当前海外网络与 Codex 会话。", ANSI.red))
                 guard confirmYesNo("确定继续吗？") else { print("已取消。"); waitForMenu(); continue }
                 stopClient(client, options: ["--yes"])
@@ -1292,9 +1616,12 @@ func interactiveMenu() -> Never {
         case "8":
             logsAndDiagnosticsMenu()
             waitForMenu()
+        case "9":
+            networkModeMenu()
+            waitForMenu()
         case "0", "q", "Q": exit(0)
         default:
-            print("无效选项，请输入 0 到 8。")
+            print("无效选项，请输入 0 到 9。")
             waitForMenu()
         }
     }
@@ -1319,10 +1646,15 @@ func usage() {
       net clash日志  查看 Clash Verge 最近警告与错误
       net 日志目录   在 Finder 中打开日志目录
       net 诊断       生成不含账号和节点信息的脱敏报告
+      net 模式       查看当前分流、兜底或直连模式
+      net 分流       国内直连，海外经 Clash + Tailscale 私网 VPS
+      net 兜底       所有公网流量临时改走 Tailscale Exit Node
+      net 直连       取消代理，保留 Tailscale 私网连接
+      net 网络诊断   比较默认路径与 Clash 代理路径
 
     危险操作确认统一支持 y/yes；命令行可使用 --yes，例如：net stop bywave --yes
 
-    高级命令：status、watch、guard、start、stop、repair、install、uninstall
+    高级命令：mode status|split|fallback|direct、diagnose-network、status、watch、guard、start、stop、repair、install、uninstall
     """)
 }
 
@@ -1330,6 +1662,7 @@ let arguments = Array(CommandLine.arguments.dropFirst())
 let safeAuditTokens = Set([
     "status", "看", "状态", "watch", "监看", "guard", "start", "stop", "repair", "清理",
     "日志", "clash日志", "日志目录", "诊断", "install", "uninstall", "help", "--help", "-h",
+    "模式", "分流", "兜底", "直连", "网络诊断", "mode", "split", "fallback", "direct", "diagnose-network",
     "--yes", "--confirm", "v2rayn", "bywave", "clash", "powervpn", "viscosity", "hillstone", "tailscale"
 ])
 let auditedArguments = arguments.map { safeAuditTokens.contains($0) ? $0 : "[参数已省略]" }
@@ -1355,6 +1688,23 @@ case "日志": showRecentLogs()
 case "clash日志": showRecentClashLogs()
 case "日志目录": openLogsDirectory()
 case "诊断": _ = generateDiagnosticReport()
+case "模式": printModeStatus()
+case "分流":
+    if !changeNetworkMode(.split, confirmed: options.contains("--yes")) { exit(1) }
+case "兜底":
+    if !changeNetworkMode(.fallback, confirmed: options.contains("--yes")) { exit(1) }
+case "直连":
+    if !changeNetworkMode(.direct, confirmed: options.contains("--yes")) { exit(1) }
+case "mode":
+    let action = arguments.dropFirst().first ?? "status"
+    switch action {
+    case "status": printModeStatus()
+    case "split": if !changeNetworkMode(.split, confirmed: options.contains("--yes")) { exit(1) }
+    case "fallback": if !changeNetworkMode(.fallback, confirmed: options.contains("--yes")) { exit(1) }
+    case "direct": if !changeNetworkMode(.direct, confirmed: options.contains("--yes")) { exit(1) }
+    default: usage(); exit(1)
+    }
+case "网络诊断", "diagnose-network": networkDiagnostic()
 case "install": installAgent()
 case "uninstall": uninstallAgent()
 case "help", "--help", "-h": usage()
