@@ -126,6 +126,8 @@ import Testing
     #expect(inferNetworkMode(tailscale: exit, clashRunning: true, clashProxyActive: true, hasOtherNetworkOwner: false) == .conflict)
     let stopped = TailscaleStatus(backendState: "Stopped", active: false, serviceAttached: true, hasOwnedRoutes: false)
     #expect(inferNetworkMode(tailscale: stopped, clashRunning: false, clashProxyActive: false, hasOtherNetworkOwner: false) == .degraded)
+    #expect(inferNetworkMode(tailscale: stopped, clashRunning: false, clashProxyActive: false, hasOtherNetworkOwner: true) == .standalone)
+    #expect(inferNetworkMode(tailscale: mesh, clashRunning: false, clashProxyActive: false, hasOtherNetworkOwner: true) == .conflict)
 }
 
 @Test func clashLogWindowFiltersOldLines() {

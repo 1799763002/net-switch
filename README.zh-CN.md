@@ -47,6 +47,10 @@ net 模式         # 查看当前分流、兜底、直连或异常状态
 net 分流         # 国内直连，海外经 Clash + Tailscale 私网 VPS
 net 兜底         # 所有公网流量临时经 Tailscale Exit Node
 net 直连         # 取消代理，保留 Tailscale 私网连接
+net 切换 viscosity # 停止 Tailscale/Clash 后单独打开 Viscosity
+net 切换 v2rayn    # 停止 Tailscale/Clash 后单独打开 v2rayN
+net 切换 bywave    # 停止 Tailscale/Clash 后单独打开 ByWave
+net 恢复         # 退出外部客户端并恢复 Tailscale + Clash 日常分流
 net 网络诊断     # 比较默认路径和 Clash 7897 代理路径
 ```
 
@@ -59,6 +63,26 @@ swift test
 ```
 
 ## 推荐切换顺序
+
+从日常 Tailscale + Clash 分流切换到其他软件时，优先使用：
+
+```bash
+net 切换 viscosity
+# 或 net 切换 v2rayn
+# 或 net 切换 bywave
+```
+
+该命令会在一次 `y/yes` 确认后依次退出 Clash、取消 Exit Node、停止 Tailscale、清理受管系统代理，再只打开目标软件。目标软件不会被自动连接，请在其界面中手动选择连接。
+
+使用结束后恢复日常网络：
+
+```bash
+net 恢复
+```
+
+它会先安全退出外部客户端，再启动 Tailscale 并恢复 Clash 分流。单独客户端正常运行时，`net` 显示“单独客户端”，不再误报为“冲突”；只有它与 Tailscale 或 Clash 同时接管网络时才显示“冲突”。
+
+手工切换时遵循：
 
 1. 运行 `net 看`，确认当前是谁在接管网络。
 2. 回到正在使用的客户端，先点击“断开”。
@@ -79,6 +103,7 @@ swift test
 - **Hillstone Secure Connect**：本工具仅依据本机生命周期日志判断连接状态。连接中或状态不明时会拒绝退出；其厂商后台服务不会被停止，也不会被当作残留。
 - **Tailscale**：后端已经停止且没有可识别的 Tailscale 路由时，即使 macOS 网络扩展仍显示挂载，也视为已停止。
 - **模式切换**：分流模式保持 Tailscale 私网在线但取消 Exit Node；兜底模式关闭 Clash 系统代理后启用 Exit Node；直连模式保留 Tailnet 私网但不代理公网。切换前会预检，失败自动恢复此前 Exit Node、Clash 和系统代理状态。
+- **单独客户端切换**：`net 切换 <软件>` 会同时处理系统代理和 Tailscale 虚拟网卡路由；普通“清理系统代理”只处理 10808/7893/7897，不会取消 Exit Node。切换失败会尝试恢复操作前的 Tailscale、Clash 和系统代理状态。
 - **Tailscale 关闭保护**：取消 Exit Node 和关闭 Tailscale 是两个独立动作；彻底关闭必须使用一次 `y/yes` 确认。
 - **后台守护**：Tailscale 仅作为私网连接时不会阻止无主代理残留清理；模式切换期间通过事务锁暂停自动修复。
 - 外部状态探测均有超时保护；即使 Tailscale 或其他客户端命令异常，`net` 菜单也不会永久卡住。

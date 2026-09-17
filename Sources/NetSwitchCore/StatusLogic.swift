@@ -75,6 +75,7 @@ public enum NetworkMode: String, Equatable {
     case fallback
     case split
     case direct
+    case standalone
     case conflict
     case degraded
 
@@ -83,6 +84,7 @@ public enum NetworkMode: String, Equatable {
         case .fallback: return "兜底"
         case .split: return "分流"
         case .direct: return "直连"
+        case .standalone: return "单独客户端"
         case .conflict: return "冲突"
         case .degraded: return "降级"
         }
@@ -95,7 +97,13 @@ public func inferNetworkMode(
     clashProxyActive: Bool,
     hasOtherNetworkOwner: Bool
 ) -> NetworkMode {
-    if hasOtherNetworkOwner || (tailscale.usingExitNode && (clashRunning || clashProxyActive)) {
+    if hasOtherNetworkOwner {
+        if tailscale.isEffectivelyActive || clashRunning || clashProxyActive {
+            return .conflict
+        }
+        return .standalone
+    }
+    if tailscale.usingExitNode && (clashRunning || clashProxyActive) {
         return .conflict
     }
     if tailscale.usingExitNode {

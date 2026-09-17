@@ -47,6 +47,10 @@ net 模式         # show split, fallback, direct, conflict, or degraded mode
 net 分流         # direct CN traffic; proxy global traffic through Clash over Tailnet
 net 兜底         # temporarily route all public traffic through the Tailscale exit node
 net 直连         # disable public proxying while keeping Tailnet private access
+net 切换 viscosity # stop Tailscale/Clash, then open Viscosity as the only network client
+net 切换 v2rayn    # stop Tailscale/Clash, then open v2rayN alone
+net 切换 bywave    # stop Tailscale/Clash, then open ByWave alone
+net 恢复         # stop the external client and restore the daily split mode
 net 网络诊断     # compare the default path with the Clash 7897 path
 ```
 
@@ -72,6 +76,7 @@ Special handling:
 - **Hillstone Secure Connect**: uses redacted local lifecycle state to decide whether a connection is active; its vendor background service is never stopped.
 - **Tailscale**: a stopped backend with no recognizable Tailscale route is treated as stopped even if a macOS network extension still appears attached.
 - **Network modes**: split mode keeps the Tailnet connected without an exit node, fallback mode uses the `vps-2026` exit node, and direct mode keeps private Tailnet access without public proxying. Failed transitions restore the previous exit-node, Clash, and proxy state.
+- **Standalone client switching**: `net 切换 <client>` releases both the managed system proxies and Tailscale routes before opening Viscosity, v2rayN, ByWave, PowerVPN, or Hillstone. A healthy external client running by itself is reported as `standalone`, not `conflict`. `net 恢复` safely exits it and restores the daily Tailscale + Clash split mode.
 - **Tailscale shutdown protection**: clearing an exit node is separate from taking Tailscale down; a full shutdown always requires `y/yes` or `--yes`.
 - **Guard behavior**: a mesh-only Tailscale connection no longer prevents stale local proxy cleanup, and automatic repair pauses while a mode transition lock exists.
 - External status probes have timeouts, so a stuck client command cannot block the `net` menu indefinitely.

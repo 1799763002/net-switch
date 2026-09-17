@@ -133,6 +133,32 @@ enum Client: String, CaseIterable {
         default: return nil
         }
     }
+
+    var supportsStandaloneSwitch: Bool {
+        switch self {
+        case .v2rayn, .bywave, .powervpn, .viscosity, .hillstone: return true
+        case .clash, .tailscale: return false
+        }
+    }
+}
+
+func parseClientArgument(_ value: String) -> Client? {
+    var normalized = value
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+    if normalized.hasSuffix(".app") {
+        normalized.removeLast(4)
+    }
+    switch normalized {
+    case "v2rayn", "v2ray": return .v2rayn
+    case "bywave": return .bywave
+    case "clash", "clashverge", "clash verge": return .clash
+    case "powervpn", "power": return .powervpn
+    case "viscosity": return .viscosity
+    case "hillstone", "hillstone secure connect": return .hillstone
+    case "tailscale": return .tailscale
+    default: return nil
+    }
 }
 
 let managedLocalProxyPorts = Set(Client.allCases.compactMap(\.proxyPort))
@@ -550,17 +576,29 @@ func snapshotSummary(_ snapshot: Snapshot) -> String {
     )
 }
 
-func openClient(_ client: Client) {
+@discardableResult
+func openClient(_ client: Client) -> Bool {
     let operationID = String(UUID().uuidString.prefix(8))
     log("操作开始 | 编号=\(operationID) | 打开 \(client.title)")
+    if client.supportsStandaloneSwitch {
+        let snapshot = takeSnapshot()
+        if snapshot.tailscaleStatus.isEffectivelyActive
+            || snapshot.isRunning(.clash)
+            || snapshot.proxyIsActive(.clash)
+            || snapshot.hasOtherNetworkOwner {
+            print(ANSI.paint("提示：当前仍有其他网络组件活动；只打开 \(client.title) 可能产生路由冲突。", ANSI.yellow))
+            print("如需让它单独接管网络，请使用：net 切换 \(client.rawValue)")
+        }
+    }
     let result = Shell.run("/usr/bin/open", ["-b", client.bundleID])
     guard result.status == 0 else {
         log("操作失败 | 编号=\(operationID) | \(client.title) 未能打开")
         print(ANSI.paint("处理失败：无法打开 \(client.title)，请确认应用仍已安装。", ANSI.red))
-        return
+        return false
     }
     log("操作成功 | 编号=\(operationID) | 已打开 \(client.title)")
     print(ANSI.paint("处理成功：已打开 \(client.title)，请在软件内手动连接。", ANSI.green))
+    return true
 }
 
 func quitApplication(_ client: Client) -> Bool {
@@ -880,7 +918,13 @@ func repair(_ confirmed: Bool, automatic: Bool = false) -> Bool {
     }
     guard !stale.isEmpty else {
         log("修复检查 | 未发现受管本地代理残留")
-        if !automatic { print(ANSI.paint("检查完成：未发现 10808/7893/7897 本地系统代理残留。", ANSI.green)) }
+        if !automatic {
+            print(ANSI.paint("检查完成：未发现 10808/7893/7897 本地系统代理残留。", ANSI.green))
+            if snapshot.tailscaleStatus.usingExitNode {
+                print(ANSI.paint("注意：Tailscale Exit Node 仍在接管全部公网流量；系统代理清理不会取消 Exit Node。", ANSI.yellow))
+                print("如需单独使用其他客户端，请执行：net 切换 <viscosity|v2rayn|bywave>")
+            }
+        }
         return true
     }
     guard confirmed else {
@@ -914,6 +958,9 @@ func repair(_ confirmed: Bool, automatic: Bool = false) -> Bool {
     if failures.isEmpty {
         log("修复完成 | 已清理 \(stale.count) 项受管本地代理残留")
         print(ANSI.paint("处理成功：已关闭 \(stale.count) 项受管本地系统代理。", ANSI.green))
+        if snapshot.tailscaleStatus.usingExitNode {
+            print(ANSI.paint("注意：Tailscale Exit Node 仍然有效；本次操作只清理了系统代理。", ANSI.yellow))
+        }
         return true
     } else {
         log("修复失败 | 部分受管本地代理残留未能清理")
@@ -925,6 +972,7 @@ func repair(_ confirmed: Bool, automatic: Bool = false) -> Bool {
 struct ModeSnapshot {
     let exitNodeName: String?
     let exitNodeAllowLANAccess: Bool
+    let tailscaleActive: Bool
     let clashRunning: Bool
     let proxyEntries: [ProxyEntry]
 }
@@ -1002,6 +1050,19 @@ func tailscaleSetExitNode(_ name: String?, allowLAN: Bool = true) -> Bool {
     return result.status == 0
 }
 
+@discardableResult
+func tailscaleSetActive(_ active: Bool) -> Bool {
+    let command = active ? "up" : "down"
+    let result = Shell.run("/usr/local/bin/tailscale", [command], timeout: 15)
+    if result.status != 0 {
+        log("模式切换步骤失败 | Tailscale \(command) 失败")
+        return false
+    }
+    return waitUntil(15) {
+        lightweightTailscaleStatus().isEffectivelyActive == active
+    }
+}
+
 func tcpReachable(host: String, port: Int) -> Bool {
     Shell.run("/usr/bin/nc", ["-G", "4", "-z", host, "\(port)"], timeout: 5).status == 0
 }
@@ -1033,13 +1094,22 @@ func captureModeSnapshot() -> ModeSnapshot {
     return ModeSnapshot(
         exitNodeName: snapshot.tailscaleStatus.exitNodeName,
         exitNodeAllowLANAccess: snapshot.tailscaleStatus.exitNodeAllowLANAccess,
+        tailscaleActive: snapshot.tailscaleStatus.isEffectivelyActive,
         clashRunning: snapshot.isRunning(.clash),
         proxyEntries: snapshot.proxyEntries.filter { managedLocalProxyPorts.contains($0.port) && isLocalHost($0.host) }
     )
 }
 
 func restoreModeSnapshot(_ saved: ModeSnapshot) {
-    _ = tailscaleSetExitNode(saved.exitNodeName, allowLAN: saved.exitNodeAllowLANAccess)
+    let currentTailscale = lightweightTailscaleStatus()
+    if saved.tailscaleActive && !currentTailscale.isEffectivelyActive {
+        _ = tailscaleSetActive(true)
+    } else if !saved.tailscaleActive && currentTailscale.isEffectivelyActive {
+        _ = tailscaleSetActive(false)
+    }
+    if saved.tailscaleActive {
+        _ = tailscaleSetExitNode(saved.exitNodeName, allowLAN: saved.exitNodeAllowLANAccess)
+    }
     if saved.clashRunning && !processIsRunning(.clash) {
         _ = Shell.run("/usr/bin/open", ["-b", Client.clash.bundleID])
         _ = waitUntil(10) { portIsListening(clashProxyPort) }
@@ -1059,6 +1129,12 @@ func printModeStatus(_ snapshot: Snapshot = takeSnapshot()) {
         print("Tailscale Exit Node：未启用（仅 Tailnet 私网）")
     }
     print("Clash 系统代理：\(effectiveSystemProxyUses(port: clashProxyPort) ? "127.0.0.1:\(clashProxyPort)" : "未启用")")
+    if snapshot.networkMode == .standalone {
+        let owners = Client.allCases
+            .filter { $0.supportsStandaloneSwitch && snapshot.isRunning($0) }
+            .map(\.title)
+        print("单独客户端：\(owners.isEmpty ? "已接管网络，客户端未识别" : owners.joined(separator: "、"))")
+    }
 }
 
 @discardableResult
@@ -1136,6 +1212,140 @@ func changeNetworkMode(_ target: NetworkMode, confirmed: Bool) -> Bool {
     operation.finish(result: "成功", detail: "模式=\(target.chineseLabel)", after: after)
     print(ANSI.paint("处理成功：已切换到\(target.chineseLabel)模式。", ANSI.green))
     printModeStatus(after)
+    return true
+}
+
+@discardableResult
+func switchToStandaloneClient(_ target: Client, confirmed: Bool) -> Bool {
+    guard target.supportsStandaloneSwitch else {
+        print(ANSI.paint("处理失败：\(target.title) 不属于可单独切换的外部客户端。", ANSI.red))
+        return false
+    }
+    guard confirmed else {
+        print(ANSI.paint("此操作将退出 Clash、取消 Tailscale Exit Node、停止 Tailscale，并清理 10808/7893/7897 系统代理。", ANSI.yellow))
+        print(ANSI.paint("网络会短暂中断；随后只打开 \(target.title)，连接动作仍需在应用内完成。", ANSI.yellow))
+        guard confirmYesNo("确认切换为单独使用 \(target.title) 吗？") else {
+            print("已取消。")
+            return false
+        }
+        return switchToStandaloneClient(target, confirmed: true)
+    }
+
+    let before = takeSnapshot()
+    let operation = OperationContext("切换到单独使用 \(target.title)", snapshot: before)
+    let saved = captureModeSnapshot()
+    let previousExternalClients = Client.allCases.filter {
+        $0.supportsStandaloneSwitch && before.isRunning($0)
+    }
+
+    setTransitionLock(true)
+    defer { setTransitionLock(false) }
+
+    func rollback(_ reason: String) -> Bool {
+        log("单独客户端切换失败 | 编号=\(operation.id) | 原因=\(reason) | 开始回滚")
+        if processIsRunning(target) {
+            _ = stopClient(target, options: ["--yes"])
+        }
+        restoreModeSnapshot(saved)
+        for client in previousExternalClients where !processIsRunning(client) {
+            _ = openClient(client)
+        }
+        let after = takeSnapshot()
+        operation.finish(result: "失败", detail: "\(reason)；已尝试恢复原网络与原应用", after: after)
+        print(ANSI.paint("切换失败：\(reason)。已尝试恢复操作前网络并重新打开原应用；连接可能仍需手动恢复。", ANSI.red))
+        return false
+    }
+
+    for client in previousExternalClients {
+        let options: Set<String> = (client == .v2rayn || client == .bywave) ? ["--yes"] : []
+        guard stopClient(client, options: options) else {
+            return rollback("无法安全退出 \(client.title)")
+        }
+    }
+
+    if before.isRunning(.clash) {
+        guard quitApplication(.clash), waitUntil(15, { !processIsRunning(.clash) }) else {
+            return rollback("Clash Verge 未能安全退出")
+        }
+    }
+    guard disableManagedProxy(port: clashProxyPort) else { return rollback("无法释放 Clash 7897 系统代理") }
+
+    if lightweightTailscaleStatus().isEffectivelyActive {
+        guard tailscaleSetExitNode(nil), waitUntil(12, { !lightweightTailscaleStatus().usingExitNode }) else {
+            return rollback("无法取消 Tailscale Exit Node")
+        }
+        guard tailscaleSetActive(false) else { return rollback("无法停止 Tailscale 后端与私网路由") }
+    }
+
+    for port in managedLocalProxyPorts {
+        guard disableManagedProxy(port: port) else { return rollback("无法清理本地 \(port) 系统代理") }
+    }
+    guard managedLocalProxyPorts.allSatisfy({ !effectiveSystemProxyUses(port: $0) }) else {
+        return rollback("仍检测到受管系统代理")
+    }
+    guard !lightweightTailscaleStatus().isEffectivelyActive else {
+        return rollback("Tailscale 仍在接管路由")
+    }
+    guard openClient(target), waitUntil(10, { processIsRunning(target) }) else {
+        return rollback("无法启动 \(target.title)")
+    }
+
+    let after = takeSnapshot()
+    guard after.networkMode == .standalone else {
+        return rollback("状态复核得到\(after.networkMode.chineseLabel)，未进入单独客户端模式")
+    }
+    operation.finish(result: "成功", detail: "目标=\(target.title)；Tailscale已停止；Clash与受管代理已释放", after: after)
+    print(ANSI.paint("准备完成：现在只有 \(target.title) 可以接管网络。", ANSI.green))
+    print("请在 \(target.title) 内选择所需连接并手动连接。使用结束后执行：net 恢复")
+    printModeStatus(after)
+    return true
+}
+
+@discardableResult
+func restoreDailySplit(confirmed: Bool) -> Bool {
+    guard confirmed else {
+        print(ANSI.paint("此操作将安全退出外部代理/VPN，启动 Tailscale，并恢复 Clash 日常分流。", ANSI.yellow))
+        guard confirmYesNo("确认恢复 Tailscale + Clash Verge 日常分流吗？") else {
+            print("已取消。")
+            return false
+        }
+        return restoreDailySplit(confirmed: true)
+    }
+
+    let before = takeSnapshot()
+    let operation = OperationContext("恢复日常分流", snapshot: before)
+    setTransitionLock(true)
+    defer { setTransitionLock(false) }
+
+    for client in Client.allCases where client.supportsStandaloneSwitch && processIsRunning(client) {
+        let options: Set<String> = (client == .v2rayn || client == .bywave) ? ["--yes"] : []
+        guard stopClient(client, options: options) else {
+            operation.finish(result: "失败", detail: "无法安全退出 \(client.title)", after: takeSnapshot())
+            print(ANSI.paint("恢复失败：\(client.title) 未能安全退出，未继续叠加其他网络组件。", ANSI.red))
+            return false
+        }
+    }
+    for port in managedLocalProxyPorts {
+        guard disableManagedProxy(port: port) else {
+            operation.finish(result: "失败", detail: "无法清理 \(port) 系统代理", after: takeSnapshot())
+            return false
+        }
+    }
+    if !lightweightTailscaleStatus().isEffectivelyActive {
+        guard tailscaleSetActive(true) else {
+            operation.finish(result: "失败", detail: "无法启动 Tailscale", after: takeSnapshot())
+            print(ANSI.paint("恢复失败：Tailscale 未能启动。", ANSI.red))
+            return false
+        }
+    }
+
+    guard changeNetworkMode(.split, confirmed: true) else {
+        operation.finish(result: "失败", detail: "Tailscale 已启动，但 Clash 分流恢复失败", after: takeSnapshot())
+        return false
+    }
+    let after = takeSnapshot()
+    operation.finish(result: "成功", detail: "已恢复 Tailscale + Clash 分流", after: after)
+    print(ANSI.paint("处理成功：已恢复日常分流。", ANSI.green))
     return true
 }
 
@@ -1544,6 +1754,18 @@ func chooseClient() -> Client? {
     return Client.allCases[index - 1]
 }
 
+func chooseStandaloneClient() -> Client? {
+    let clients = Client.allCases.filter(\.supportsStandaloneSwitch)
+    print("\n请选择需要单独使用的软件：")
+    for (index, client) in clients.enumerated() {
+        print("  \(index + 1). \(client.title)")
+    }
+    print("  0. 返回")
+    print("请输入数字：", terminator: "")
+    guard let text = readLine(), let index = Int(text), index > 0, index <= clients.count else { return nil }
+    return clients[index - 1]
+}
+
 func networkModeMenu() {
     print("""
 
@@ -1581,6 +1803,8 @@ func interactiveMenu() -> Never {
   7. 开机自动守护    安装后台检查与自动清理
   8. 日志与诊断      查看日志、打开目录或生成脱敏报告
   9. 网络模式        分流、兜底、直连与当前状态
+ 10. 单独使用软件    停止 Tailscale/Clash 后打开指定代理或公司 VPN
+ 11. 恢复日常分流    退出外部客户端并恢复 Tailscale + Clash
   0. 退出助手
 """)
         print("请输入数字：", terminator: "")
@@ -1619,9 +1843,17 @@ func interactiveMenu() -> Never {
         case "9":
             networkModeMenu()
             waitForMenu()
+        case "10":
+            if let client = chooseStandaloneClient() {
+                _ = switchToStandaloneClient(client, confirmed: false)
+                waitForMenu()
+            }
+        case "11":
+            _ = restoreDailySplit(confirmed: false)
+            waitForMenu()
         case "0", "q", "Q": exit(0)
         default:
-            print("无效选项，请输入 0 到 9。")
+            print("无效选项，请输入 0 到 11。")
             waitForMenu()
         }
     }
@@ -1650,11 +1882,19 @@ func usage() {
       net 分流       国内直连，海外经 Clash + Tailscale 私网 VPS
       net 兜底       所有公网流量临时改走 Tailscale Exit Node
       net 直连       取消代理，保留 Tailscale 私网连接
+      net 切换 软件  停止 Tailscale/Clash 后单独打开 Viscosity、v2rayN、ByWave 等
+      net 恢复       退出外部客户端并恢复 Tailscale + Clash 日常分流
       net 网络诊断   比较默认路径与 Clash 代理路径
+
+    单独使用示例：
+      net 切换 viscosity
+      net 切换 v2rayn
+      net 切换 bywave
+      net 恢复
 
     危险操作确认统一支持 y/yes；命令行可使用 --yes，例如：net stop bywave --yes
 
-    高级命令：mode status|split|fallback|direct、diagnose-network、status、watch、guard、start、stop、repair、install、uninstall
+    高级命令：switch-client、restore-daily、mode status|split|fallback|direct、diagnose-network、status、watch、guard、start、stop、repair、install、uninstall
     """)
 }
 
@@ -1662,7 +1902,7 @@ let arguments = Array(CommandLine.arguments.dropFirst())
 let safeAuditTokens = Set([
     "status", "看", "状态", "watch", "监看", "guard", "start", "stop", "repair", "清理",
     "日志", "clash日志", "日志目录", "诊断", "install", "uninstall", "help", "--help", "-h",
-    "模式", "分流", "兜底", "直连", "网络诊断", "mode", "split", "fallback", "direct", "diagnose-network",
+    "模式", "分流", "兜底", "直连", "切换", "恢复", "网络诊断", "mode", "split", "fallback", "direct", "switch-client", "restore-daily", "diagnose-network",
     "--yes", "--confirm", "v2rayn", "bywave", "clash", "powervpn", "viscosity", "hillstone", "tailscale"
 ])
 let auditedArguments = arguments.map { safeAuditTokens.contains($0) ? $0 : "[参数已省略]" }
@@ -1677,10 +1917,10 @@ case "status", "看", "状态":
 case "watch", "监看": watch()
 case "guard": guardLoop()
 case "start":
-    guard arguments.count >= 2, let client = Client(rawValue: arguments[1]) else { usage(); exit(1) }
+    guard arguments.count >= 2, let client = parseClientArgument(arguments[1]) else { usage(); exit(1) }
     openClient(client)
 case "stop":
-    guard arguments.count >= 2, let client = Client(rawValue: arguments[1]) else { usage(); exit(1) }
+    guard arguments.count >= 2, let client = parseClientArgument(arguments[1]) else { usage(); exit(1) }
     if !stopClient(client, options: options) { exit(1) }
 case "repair", "清理":
     if !repair(options.contains("--yes") || options.contains("--confirm")) { exit(1) }
@@ -1695,6 +1935,13 @@ case "兜底":
     if !changeNetworkMode(.fallback, confirmed: options.contains("--yes")) { exit(1) }
 case "直连":
     if !changeNetworkMode(.direct, confirmed: options.contains("--yes")) { exit(1) }
+case "切换", "switch-client":
+    guard arguments.count >= 2,
+          let client = parseClientArgument(arguments[1]),
+          client.supportsStandaloneSwitch else { usage(); exit(1) }
+    if !switchToStandaloneClient(client, confirmed: options.contains("--yes")) { exit(1) }
+case "恢复", "restore-daily":
+    if !restoreDailySplit(confirmed: options.contains("--yes")) { exit(1) }
 case "mode":
     let action = arguments.dropFirst().first ?? "status"
     switch action {
