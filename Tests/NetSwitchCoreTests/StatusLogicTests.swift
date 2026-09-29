@@ -143,3 +143,12 @@ import Testing
     #expect(logLineIsWithin("09-16 11:59:00 WARNING failed", hours: 24, now: now))
     #expect(logLineIsWithin("[2026-09-16 11:59:00.123] level=warning timeout", hours: 24, now: now))
 }
+
+@Test func stoppedTailscaleRetainsExitPreferenceWithoutClaimingActiveExit() throws {
+    let data = #"{"BackendState":"Stopped","Peer":{"node":{"ID":"node-1","HostName":"vps-2026","Online":true,"ExitNode":false}}}"#.data(using: .utf8)!
+    let prefs = #"{"ExitNodeID":"node-1","ExitNodeAllowLANAccess":true}"#.data(using: .utf8)!
+    let status = try #require(parseTailscaleStatus(statusData: data, preferencesData: prefs, serviceAttached: true, hasOwnedRoutes: false))
+    #expect(status.exitNodeName == "vps-2026")
+    #expect(!status.usingExitNode)
+    #expect(inferNetworkMode(tailscale: status, clashRunning: false, clashProxyActive: false, hasOtherNetworkOwner: true) == .standalone)
+}

@@ -62,7 +62,7 @@ public struct TailscaleStatus: Equatable {
         isSafelyStopped && serviceAttached
     }
 
-    public var usingExitNode: Bool { exitNodeName != nil }
+    public var usingExitNode: Bool { isEffectivelyActive && exitNodeName != nil }
 }
 
 public enum TailscaleConnectionPath: String, Equatable {
@@ -130,8 +130,12 @@ public func parseTailscaleStatus(
     }
     let peers = object["Peer"] as? [String: Any] ?? [:]
     let decodedPeers = peers.values.compactMap { $0 as? [String: Any] }
+    let configuredID = preferences?["ExitNodeID"] as? String ?? ""
+    let configuredIP = preferences?["ExitNodeIP"] as? String ?? ""
     let selected = decodedPeers.first {
         ($0["ExitNode"] as? Bool) == true
+            || (!configuredID.isEmpty && ($0["ID"] as? String) == configuredID)
+            || (!configuredIP.isEmpty && ($0["TailscaleIPs"] as? [String] ?? []).contains(configuredIP))
     }
     let preferredPeer = selected ?? decodedPeers.first {
         ($0["HostName"] as? String)?.localizedCaseInsensitiveCompare("vps-2026") == .orderedSame

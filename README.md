@@ -99,3 +99,9 @@ Please open an issue with a redacted `net 诊断` report, the macOS version, the
 ## License
 
 [MIT](LICENSE)
+
+### Restore and diagnostic behavior
+
+Daily restore captures the state before stopping external clients. A stopped Tailscale backend has its retained Exit Node preference cleared before startup so it starts in private-network mode. On failure, restore attempts to recover the original configuration and reopen previous apps, including ByWave's previous TUN state. Other VPNs may require manual reconnection. Configuration rollback is verified separately from Internet connectivity.
+
+Connectivity attempts record curl's exit code, HTTP status, duration, and redacted errors. Clash diagnostics include rotated sessions as well as the latest log, filter individual lines to the last 24 hours, and deduplicate route selections and errors. Nested mode changes keep the background guard paused until the outer operation finishes.

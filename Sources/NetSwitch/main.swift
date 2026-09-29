@@ -226,7 +226,15 @@ struct Snapshot {
     }
 
     var hasOtherNetworkOwner: Bool {
-        Client.allCases.filter { $0 != .tailscale && $0 != .clash }.contains { isRunning($0) }
+        let otherClientOwnsNetwork = Client.allCases
+            .filter { $0 != .tailscale && $0 != .clash && $0 != .bywave }
+            .contains { isRunning($0) }
+        // The ByWave app may be open simply to edit settings while both its
+        // system proxy and TUN are disabled. That is not a competing route.
+        let byWaveOwnsNetwork = isRunning(.bywave)
+            && (proxyIsActive(.bywave) || byWaveTunEnabled)
+        return otherClientOwnsNetwork
+            || byWaveOwnsNetwork
             || connectedVPNs.contains { !$0.localizedCaseInsensitiveContains("Tailscale") }
             || hasActiveViscosityConnection
             || hillstoneConnectionState == .connected
@@ -570,7 +578,10 @@ func snapshotSummary(_ snapshot: Snapshot) -> String {
     redactedStateSummary(
         runningClients: snapshot.runningClientNames,
         effectiveVPNs: snapshot.effectiveVPNNames,
-        proxyCount: staleLocalProxyEntries(snapshot).count,
+        proxyCount: staleLocalProxyEntries(snapshot).filter { entry in
+            guard let owner = proxyOwner(for: entry) else { return true }
+            return !snapshot.isRunning(owner)
+        }.count,
         hasUtunRoutes: !snapshot.utunRouteLines.isEmpty,
         v2Protected: false
     )
@@ -739,9 +750,13 @@ func stopClient(_ client: Client, options: Set<String>) -> Bool {
             print(ANSI.paint("部分完成：ByWave TUN 已停用，但应用未接受正常退出请求。", ANSI.yellow))
             return false
         }
-        guard waitUntil(15, {
-            !processIsRunning(.bywave) && !effectiveSystemProxyUses(port: 7893)
-        }) else {
+        let exited = waitUntil(15) { !processIsRunning(.bywave) }
+        if exited && !byWaveTunIsEnabled() {
+            // A proxy restored by net may not be tracked by the app's own UI.
+            // Once its process has exited, release only its managed local port.
+            _ = disableManagedProxy(port: 7893)
+        }
+        guard exited && !effectiveSystemProxyUses(port: 7893) else {
             let processActive = processIsRunning(.bywave)
             let proxyActive = effectiveSystemProxyUses(port: 7893)
             operation.finish(
@@ -981,7 +996,12 @@ func transitionLockURL() -> URL {
     logsDirectory().appendingPathComponent("mode-transition.lock")
 }
 
+// CLI mutations run synchronously on its main thread.
+nonisolated(unsafe) var transitionLockDepth = 0
+
 func setTransitionLock(_ enabled: Bool) {
+    transitionLockDepth = max(0, transitionLockDepth + (enabled ? 1 : -1))
+    if !enabled && transitionLockDepth > 0 { return }
     let file = transitionLockURL()
     if enabled {
         try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -1068,7 +1088,7 @@ func tcpReachable(host: String, port: Int) -> Bool {
 }
 
 func curlProbe(_ url: String, proxyPort: Int? = nil) -> (ok: Bool, summary: String) {
-    var arguments = ["-sS", "-L", "--max-time", "10", "-o", "/dev/null", "-w", "%{http_code} %{time_total}"]
+    var arguments = ["-sS", "-L", "--max-time", "10", "-o", "/dev/null", "-w", "\nNET_PROBE %{http_code} %{time_total}"]
     if let proxyPort {
         arguments += ["--proxy", "http://127.0.0.1:\(proxyPort)"]
     } else {
@@ -1076,14 +1096,17 @@ func curlProbe(_ url: String, proxyPort: Int? = nil) -> (ok: Bool, summary: Stri
     }
     arguments.append(url)
     let result = Shell.run("/usr/bin/curl", arguments, timeout: 12)
-    let value = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
-    let code = Int(value.split(separator: " ").first ?? "0") ?? 0
-    return (result.status == 0 && code >= 200 && code < 500, value.isEmpty ? "失败" : value)
+    return parseCurlProbe(output: result.output, status: result.status)
 }
 
 func curlProbeSucceeds(_ url: String, proxyPort: Int? = nil, attempts: Int = 3) -> Bool {
     for attempt in 1...attempts {
-        if curlProbe(url, proxyPort: proxyPort).ok { return true }
+        let probe = curlProbe(url, proxyPort: proxyPort)
+        let target = URL(string: url)?.host ?? "未知目标"
+        let path = proxyPort.map { "本地代理端口=\($0)" } ?? "默认路由"
+        log("网络探测 | 目标=\(target) | \(path) | 尝试=\(attempt)/\(attempts) | 结果=\(probe.ok ? "成功" : "失败") | \(sanitizedLogLine(probe.summary))")
+        if probe.ok { return true }
+        print("连通检查未通过（\(attempt)/\(attempts)）：\(sanitizedLogLine(probe.summary))")
         if attempt < attempts { Thread.sleep(forTimeInterval: 1) }
     }
     return false
@@ -1100,16 +1123,15 @@ func captureModeSnapshot() -> ModeSnapshot {
     )
 }
 
-func restoreModeSnapshot(_ saved: ModeSnapshot) {
+@discardableResult
+func restoreModeSnapshot(_ saved: ModeSnapshot) -> Bool {
     let currentTailscale = lightweightTailscaleStatus()
     if saved.tailscaleActive && !currentTailscale.isEffectivelyActive {
         _ = tailscaleSetActive(true)
     } else if !saved.tailscaleActive && currentTailscale.isEffectivelyActive {
         _ = tailscaleSetActive(false)
     }
-    if saved.tailscaleActive {
-        _ = tailscaleSetExitNode(saved.exitNodeName, allowLAN: saved.exitNodeAllowLANAccess)
-    }
+    _ = tailscaleSetExitNode(saved.exitNodeName, allowLAN: saved.exitNodeAllowLANAccess)
     if saved.clashRunning && !processIsRunning(.clash) {
         _ = Shell.run("/usr/bin/open", ["-b", Client.clash.bundleID])
         _ = waitUntil(10) { portIsListening(clashProxyPort) }
@@ -1118,6 +1140,19 @@ func restoreModeSnapshot(_ saved: ModeSnapshot) {
         _ = waitUntil(10) { !processIsRunning(.clash) }
     }
     restoreProxyEntries(saved.proxyEntries)
+    let verified = modeSnapshotMatches(saved)
+    log("回滚复核 | 结果=\(verified ? "配置已恢复" : "未完全恢复，需检查")")
+    return verified
+}
+
+func modeSnapshotMatches(_ saved: ModeSnapshot) -> Bool {
+    let current = captureModeSnapshot()
+    return current.tailscaleActive == saved.tailscaleActive
+        && current.exitNodeName == saved.exitNodeName
+        && current.exitNodeAllowLANAccess == saved.exitNodeAllowLANAccess
+        && current.clashRunning == saved.clashRunning
+        && current.proxyEntries.count == saved.proxyEntries.count
+        && saved.proxyEntries.allSatisfy { current.proxyEntries.contains($0) }
 }
 
 func printModeStatus(_ snapshot: Snapshot = takeSnapshot()) {
@@ -1153,10 +1188,11 @@ func changeNetworkMode(_ target: NetworkMode, confirmed: Bool) -> Bool {
 
     func rollback(_ reason: String) -> Bool {
         log("模式切换失败 | 编号=\(operation.id) | 原因=\(reason) | 开始回滚")
-        restoreModeSnapshot(saved)
+        let restored = restoreModeSnapshot(saved)
+        let recovery = restored ? "操作前配置已恢复，连通性未复测" : "回滚未完全成功，请检查网络状态"
         let after = takeSnapshot()
-        operation.finish(result: "失败", detail: "\(reason)；已执行回滚", after: after)
-        print(ANSI.paint("切换失败：\(reason)。已恢复操作前的网络状态。", ANSI.red))
+        operation.finish(result: "失败", detail: "\(reason)；\(recovery)", after: after)
+        print(ANSI.paint("切换失败：\(reason)。\(recovery)。", ANSI.red))
         return false
     }
 
@@ -1164,14 +1200,18 @@ func changeNetworkMode(_ target: NetworkMode, confirmed: Bool) -> Bool {
     case .split:
         guard before.tailscaleStatus.isEffectivelyActive else { return rollback("Tailscale 尚未连接") }
         guard !before.hasOtherNetworkOwner else { return rollback("检测到 Clash 之外的其他网络客户端") }
-        let reachablePorts = [443, 9443, 22].filter { tcpReachable(host: splitVPSAddress, port: $0) }
+        let reachablePorts = [443, 9443, 22].filter { port in
+            let reachable = tcpReachable(host: splitVPSAddress, port: port)
+            log("私网端口预检 | 编号=\(operation.id) | 端口=\(port) | 结果=\(reachable ? "可达" : "不可达")")
+            return reachable
+        }
         guard !reachablePorts.isEmpty else { return rollback("Tailscale 私网 AnyTLS、VLESS 和 SSH 端口均不可达") }
         if !processIsRunning(.clash) {
             guard Shell.run("/usr/bin/open", ["-b", Client.clash.bundleID]).status == 0 else { return rollback("无法启动 Clash Verge") }
         }
         guard waitUntil(15, { portIsListening(clashProxyPort) }) else { return rollback("Clash 本地 7897 端口没有监听") }
         guard curlProbeSucceeds("https://www.google.com/generate_204", proxyPort: clashProxyPort) else {
-            return rollback("取消 Exit Node 前的 Clash 海外预检失败")
+            return rollback("Clash 海外预检失败（尚未修改 Exit Node；详见网络探测日志）")
         }
         guard tailscaleSetExitNode(nil), waitUntil(12, { !lightweightTailscaleStatus().usingExitNode }) else {
             return rollback("无法取消 Tailscale Exit Node")
@@ -1313,35 +1353,59 @@ func restoreDailySplit(confirmed: Bool) -> Bool {
     }
 
     let before = takeSnapshot()
+    let saved = captureModeSnapshot()
+    let previousExternalClients = Client.allCases.filter { $0.supportsStandaloneSwitch && before.isRunning($0) }
     let operation = OperationContext("恢复日常分流", snapshot: before)
     setTransitionLock(true)
     defer { setTransitionLock(false) }
 
+    func rollback(_ reason: String) -> Bool {
+        // Restore the outer operation, not the intermediate state after starting Tailscale.
+        _ = restoreModeSnapshot(saved)
+        for client in previousExternalClients where !processIsRunning(client) {
+            _ = openClient(client)
+        }
+        var byWaveRestored = true
+        if previousExternalClients.contains(.bywave) {
+            byWaveRestored = waitUntil(15) { portIsListening(7893) }
+            if byWaveRestored {
+                let result = Shell.run("/usr/bin/curl", ["-fsS", "--max-time", "3", "-X", "PATCH",
+                    "-H", "Content-Type: application/json", "-d", "{\"tun\":{\"enable\":\(before.byWaveTunEnabled ? "true" : "false")}}",
+                    "http://127.0.0.1:9090/configs"], timeout: 5)
+                byWaveRestored = result.status == 0 && waitUntil(10) { byWaveTunIsEnabled() == before.byWaveTunEnabled }
+            }
+        }
+        // Apps may reset proxies during launch; reapply the original entries afterwards.
+        restoreProxyEntries(saved.proxyEntries)
+        let restored = modeSnapshotMatches(saved)
+        let detail = "\(reason)；已尝试恢复整次操作前配置；配置复核=\(restored ? "通过" : "未通过")；ByWave恢复=\(byWaveRestored ? "通过或无需恢复" : "未通过")"
+        operation.finish(result: "失败", detail: detail, after: takeSnapshot())
+        print(ANSI.paint("恢复失败：\(reason)。已尝试恢复原网络和原应用；请复核连接，其他 VPN 可能需手动重连。", ANSI.red))
+        return false
+    }
+
     for client in Client.allCases where client.supportsStandaloneSwitch && processIsRunning(client) {
         let options: Set<String> = (client == .v2rayn || client == .bywave) ? ["--yes"] : []
         guard stopClient(client, options: options) else {
-            operation.finish(result: "失败", detail: "无法安全退出 \(client.title)", after: takeSnapshot())
-            print(ANSI.paint("恢复失败：\(client.title) 未能安全退出，未继续叠加其他网络组件。", ANSI.red))
-            return false
+            return rollback("无法安全退出 \(client.title)")
         }
     }
     for port in managedLocalProxyPorts {
         guard disableManagedProxy(port: port) else {
-            operation.finish(result: "失败", detail: "无法清理 \(port) 系统代理", after: takeSnapshot())
-            return false
+            return rollback("无法清理 \(port) 系统代理")
         }
     }
     if !lightweightTailscaleStatus().isEffectivelyActive {
+        // A stopped backend can retain an Exit Node preference. Start directly
+        // in the requested private-network mode instead of reviving a global route.
+        guard tailscaleSetExitNode(nil) else { return rollback("无法清除停用期间保留的 Exit Node") }
         guard tailscaleSetActive(true) else {
-            operation.finish(result: "失败", detail: "无法启动 Tailscale", after: takeSnapshot())
-            print(ANSI.paint("恢复失败：Tailscale 未能启动。", ANSI.red))
-            return false
+            return rollback("无法启动 Tailscale")
         }
     }
 
     guard changeNetworkMode(.split, confirmed: true) else {
-        operation.finish(result: "失败", detail: "Tailscale 已启动，但 Clash 分流恢复失败", after: takeSnapshot())
-        return false
+        return rollback("Tailscale 已启动，但 Clash 分流恢复失败")
     }
     let after = takeSnapshot()
     operation.finish(result: "成功", detail: "已恢复 Tailscale + Clash 分流", after: after)
@@ -1480,27 +1544,14 @@ func clashLogsDirectory() -> URL {
 }
 
 func recentClashExceptionalLogLines(limit: Int) -> [String] {
-    let directory = clashLogsDirectory()
-    let candidates = [
-        directory.appendingPathComponent("sidecar/sidecar_latest.log"),
-        directory.appendingPathComponent("latest.log")
-    ]
-    let markers = ["level=error", "level=warning", " error ", " warn ", "timeout", "deadline", "reset", "failed"]
-    return candidates.flatMap { file -> [String] in
-        guard let text = try? String(contentsOf: file, encoding: .utf8) else { return [] }
-        return text.split(separator: "\n").map(String.init).filter { line in
-            let lowered = line.lowercased()
-            return logLineIsWithin(line, hours: 24)
-                && markers.contains { lowered.contains($0) }
-        }
-    }.suffix(limit).map(sanitizedLogLine)
+    recentClashLogLines(directory: clashLogsDirectory(), limit: limit).map(sanitizedLogLine)
 }
 
 func showRecentClashLogs() {
     let lines = recentClashExceptionalLogLines(limit: 80)
-    print(ANSI.paint("Clash Verge 最近 24 小时警告与错误（已脱敏）", ANSI.bold + ANSI.cyan))
+    print(ANSI.paint("Clash Verge 最近 24 小时异常与连接记录（含轮转日志，已脱敏）", ANSI.bold + ANSI.cyan))
     if lines.isEmpty {
-        print("当前持久化日志中没有发现警告、超时或错误。")
+        print("当前持久化日志中没有发现最近 24 小时的异常或连接记录。")
     } else {
         lines.forEach { print($0) }
     }
@@ -1515,7 +1566,9 @@ func guardProcessStatus() -> String {
 }
 
 func portIsListening(_ port: Int) -> Bool {
-    Shell.run("/usr/sbin/lsof", ["-nP", "-iTCP:\(port)", "-sTCP:LISTEN"]).status == 0
+    // Privileged helpers can own sockets that unprivileged lsof cannot see.
+    // Probe the same loopback address used by our HTTP checks instead.
+    Shell.run("/usr/bin/nc", ["-G", "1", "-z", "127.0.0.1", "\(port)"], timeout: 2).status == 0
 }
 
 @discardableResult
