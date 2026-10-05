@@ -165,6 +165,7 @@ let managedLocalProxyPorts = Set(Client.allCases.compactMap(\.proxyPort))
 let splitVPSAddress = "100.110.219.72"
 let splitVPSName = "vps-2026"
 let clashProxyPort = 7897
+let clashFallbackGroupName = "VPS-2026"
 
 func isShellCommandLine(_ line: String) -> Bool {
     let command = line.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -672,6 +673,24 @@ func effectiveSystemProxyUses(port: Int) -> Bool {
     }
 }
 
+func systemProxyUsesAllProtocols(port: Int) -> Bool {
+    let lines = commandLines("/usr/sbin/scutil", ["--proxy"])
+    var values: [String: String] = [:]
+    for line in lines {
+        let parts = line.split(separator: ":", maxSplits: 1).map {
+            $0.trimmingCharacters(in: .whitespaces)
+        }
+        if parts.count == 2 { values[parts[0]] = parts[1] }
+    }
+    return [
+        ("HTTPEnable", "HTTPPort"),
+        ("HTTPSEnable", "HTTPSPort"),
+        ("SOCKSEnable", "SOCKSPort")
+    ].allSatisfy { enabledKey, portKey in
+        values[enabledKey] == "1" && Int(values[portKey] ?? "") == port
+    }
+}
+
 func powerVPNIsConnected() -> Bool {
     connectedVPNs().contains { $0.contains("小地球仪") }
 }
@@ -1112,6 +1131,32 @@ func curlProbeSucceeds(_ url: String, proxyPort: Int? = nil, attempts: Int = 3) 
     return false
 }
 
+func splitReadinessSample() -> (ok: Bool, detail: String) {
+    let portReady = portIsListening(clashProxyPort)
+    let proxyReady = systemProxyUsesAllProtocols(port: clashProxyPort)
+    let tailscale = lightweightTailscaleStatus()
+    let tailscaleReady = tailscale.isEffectivelyActive && !tailscale.usingExitNode
+    let snapshot = takeSnapshot()
+    let modeReady = snapshot.networkMode == .split
+    let probe = curlProbe("https://www.google.com/generate_204", proxyPort: clashProxyPort)
+    let probeReady = probe.ok
+    let detail = "端口=\(portReady ? "通过" : "失败") | 系统代理=\(proxyReady ? "通过" : "失败") | Tailscale=\(tailscaleReady ? "通过" : "失败") | 模式=\(modeReady ? "通过" : "失败") | Google代理=\(probeReady ? "通过" : "失败")"
+    return (portReady && proxyReady && tailscaleReady && modeReady && probeReady, detail)
+}
+
+func waitForStableSplitReadiness(operationID: String) -> Bool {
+    var samples: [Bool] = []
+    for attempt in 1...3 {
+        let sample = splitReadinessSample()
+        samples.append(sample.ok)
+        let streak = samples.reversed().prefix { $0 }.count
+        log("分流稳定复核 | 编号=\(operationID) | 采样=\(attempt)/3 | 结果=\(sample.ok ? "通过" : "失败") | 连续通过=\(streak) | \(sample.detail)")
+        if hasConsecutiveSuccesses(samples, required: 2) { return true }
+        if attempt < 3 { Thread.sleep(forTimeInterval: 1) }
+    }
+    return false
+}
+
 func captureModeSnapshot() -> ModeSnapshot {
     let snapshot = takeSnapshot()
     return ModeSnapshot(
@@ -1222,6 +1267,9 @@ func changeNetworkMode(_ target: NetworkMode, confirmed: Bool) -> Bool {
         guard curlProbeSucceeds("https://www.baidu.com", attempts: 2) else { return rollback("国内直连检查失败") }
         guard curlProbeSucceeds("https://www.google.com/generate_204", proxyPort: clashProxyPort) else {
             return rollback("海外代理检查失败")
+        }
+        guard waitForStableSplitReadiness(operationID: operation.id) else {
+            return rollback("Clash 分流最终稳定复核失败（连续两次采样未通过；详见分流稳定复核日志）")
         }
     case .fallback:
         if processIsRunning(.clash) {
@@ -1413,6 +1461,106 @@ func restoreDailySplit(confirmed: Bool) -> Bool {
     return true
 }
 
+private struct ClashProxyHistoryEntry: Decodable {
+    let time: String
+    let delay: Int
+}
+
+private struct ClashProxyDetails: Decodable {
+    let alive: Bool?
+    let all: [String]?
+    let history: [ClashProxyHistoryEntry]?
+    let name: String
+    let now: String?
+}
+
+private struct ClashNodeHealth {
+    let name: String
+    let alive: Bool?
+    let delay: Int?
+    let checkedAt: String?
+}
+
+private struct ClashNodeHealthReport {
+    let selectedNode: String?
+    let nodes: [ClashNodeHealth]
+    let failure: String?
+}
+
+func clashControllerSocketPath() -> String? {
+    let directory = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/io.github.clash-verge-rev.clash-verge-rev", isDirectory: true)
+    let candidates = ["clash-verge.yaml", "config.yaml"].map(directory.appendingPathComponent)
+    for file in candidates {
+        guard let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
+        for line in text.split(whereSeparator: \.isNewline) {
+            let parts = line.split(separator: ":", maxSplits: 1)
+            guard parts.count == 2,
+                  parts[0].trimmingCharacters(in: .whitespaces) == "external-controller-unix" else { continue }
+            let path = parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\\\"'"))
+            if FileManager.default.fileExists(atPath: path) { return path }
+        }
+    }
+    return nil
+}
+
+private func clashProxyDetails(named name: String, socketPath: String) -> ClashProxyDetails? {
+    var allowed = CharacterSet.alphanumerics
+    allowed.insert(charactersIn: "-._~")
+    guard let encodedName = name.addingPercentEncoding(withAllowedCharacters: allowed) else { return nil }
+    let result = Shell.run(
+        "/usr/bin/curl",
+        ["-sS", "--unix-socket", socketPath, "--max-time", "3", "http://localhost/proxies/\(encodedName)"],
+        timeout: 5
+    )
+    guard result.status == 0, let data = result.output.data(using: .utf8) else { return nil }
+    return try? JSONDecoder().decode(ClashProxyDetails.self, from: data)
+}
+
+private func currentClashNodeHealth() -> ClashNodeHealthReport {
+    guard let socketPath = clashControllerSocketPath() else {
+        return ClashNodeHealthReport(selectedNode: nil, nodes: [], failure: "未找到可用的 Clash 本地控制接口")
+    }
+    guard let group = clashProxyDetails(named: clashFallbackGroupName, socketPath: socketPath) else {
+        return ClashNodeHealthReport(selectedNode: nil, nodes: [], failure: "无法读取 Clash fallback 组状态")
+    }
+    let nodes = (group.all ?? []).map { name -> ClashNodeHealth in
+        let detail = clashProxyDetails(named: name, socketPath: socketPath)
+        let latest = detail?.history?.last
+        return ClashNodeHealth(
+            name: name,
+            alive: detail?.alive,
+            delay: latest?.delay,
+            checkedAt: latest?.time
+        )
+    }
+    return ClashNodeHealthReport(selectedNode: group.now, nodes: nodes, failure: nil)
+}
+
+func showClashNodeHealth() {
+    let report = currentClashNodeHealth()
+    print(ANSI.paint("Clash 节点体检（读取现有健康记录，不切换节点）", ANSI.bold + ANSI.cyan))
+    if let failure = report.failure {
+        print("体检不可用：\(failure)")
+        log("操作 | 节点体检 | 结果=不可用 | 原因=\(failure)")
+        return
+    }
+    print("Fallback 组：\(clashFallbackGroupName)；当前选中：\(report.selectedNode ?? "未知")")
+    for node in report.nodes {
+        let state: String
+        if node.alive == true, let delay = node.delay, delay > 0 {
+            state = "正常（\(delay) ms）"
+        } else if node.alive == false || node.delay == 0 {
+            state = "不可用"
+        } else {
+            state = "暂无健康记录"
+        }
+        print("- \(node.name)：\(state)\(node.checkedAt.map { "；最近检测 \($0)" } ?? "")")
+    }
+    log("操作 | 节点体检 | 当前=\(report.selectedNode ?? "未知") | 节点数=\(report.nodes.count)")
+}
+
 func networkDiagnostic() {
     let snapshot = takeSnapshot()
     print(ANSI.paint("网络路径诊断（只读）", ANSI.bold + ANSI.cyan))
@@ -1431,6 +1579,7 @@ func networkDiagnostic() {
     } else {
         print("Clash 7897：未监听，跳过代理路径测试")
     }
+    showClashNodeHealth()
     let dns = Shell.run("/usr/bin/dscacheutil", ["-q", "host", "-a", "name", "chatgpt.com"], timeout: 5)
     print("DNS / chatgpt.com：\(dns.status == 0 && !dns.output.isEmpty ? "成功" : "失败")")
     log("操作 | 网络路径诊断 | 模式=\(snapshot.networkMode.chineseLabel) | 国内=\(directCN.ok ? "成功" : "失败") | 默认海外=\(directGlobal.ok ? "成功" : "失败") | Clash监听=\(portIsListening(clashProxyPort) ? "是" : "否")")
@@ -1544,19 +1693,35 @@ func clashLogsDirectory() -> URL {
 }
 
 func recentClashExceptionalLogLines(limit: Int) -> [String] {
-    recentClashLogLines(directory: clashLogsDirectory(), limit: limit).map(sanitizedLogLine)
+    recentClashLogLines(directory: clashLogsDirectory(), category: .exception, limit: limit).map(sanitizedLogLine)
+}
+
+func recentClashRouteLogLines(limit: Int) -> [String] {
+    recentClashLogLines(directory: clashLogsDirectory(), category: .route, limit: limit).map(sanitizedLogLine)
 }
 
 func showRecentClashLogs() {
     let lines = recentClashExceptionalLogLines(limit: 80)
-    print(ANSI.paint("Clash Verge 最近 24 小时异常与连接记录（含轮转日志，已脱敏）", ANSI.bold + ANSI.cyan))
+    print(ANSI.paint("Clash Verge 最近 24 小时异常日志（含轮转日志，已脱敏）", ANSI.bold + ANSI.cyan))
     if lines.isEmpty {
-        print("当前持久化日志中没有发现最近 24 小时的异常或连接记录。")
+        print("当前持久化日志中没有发现最近 24 小时的异常。")
     } else {
         lines.forEach { print($0) }
     }
     print("\n更早的历史记录已省略。原始日志目录：\(clashLogsDirectory().path)")
     log("操作 | 查看 Clash Verge 最近 24 小时警告与错误 | 条数=\(lines.count)")
+}
+
+func showRecentClashRoutes() {
+    let lines = recentClashRouteLogLines(limit: 80)
+    print(ANSI.paint("Clash Verge 最近 24 小时路由选择（含轮转日志，已脱敏）", ANSI.bold + ANSI.cyan))
+    if lines.isEmpty {
+        print("当前持久化日志中没有发现最近 24 小时的 TCP/UDP 路由选择。")
+    } else {
+        lines.forEach { print($0) }
+    }
+    print("\n更早的历史记录已省略。原始日志目录：\(clashLogsDirectory().path)")
+    log("操作 | 查看 Clash Verge 最近 24 小时路由选择 | 条数=\(lines.count)")
 }
 
 func guardProcessStatus() -> String {
@@ -1640,6 +1805,7 @@ func logsAndDiagnosticsMenu() {
   2. 打开日志目录    在 Finder 中打开隐藏目录
   3. 生成诊断报告    保存脱敏后的状态与最近异常
   4. Clash 日志     显示 Clash Verge 最近警告与错误
+  5. Clash 路径     显示 Clash Verge 最近 TCP/UDP 路由选择
   0. 返回
 """)
     print("请输入数字：", terminator: "")
@@ -1648,6 +1814,7 @@ func logsAndDiagnosticsMenu() {
     case "2": openLogsDirectory()
     case "3": _ = generateDiagnosticReport()
     case "4": showRecentClashLogs()
+    case "5": showRecentClashRoutes()
     default: return
     }
 }
@@ -1858,6 +2025,7 @@ func interactiveMenu() -> Never {
   9. 网络模式        分流、兜底、直连与当前状态
  10. 单独使用软件    停止 Tailscale/Clash 后打开指定代理或公司 VPN
  11. 恢复日常分流    退出外部客户端并恢复 Tailscale + Clash
+ 12. 节点体检        读取 Clash fallback 节点的现有健康记录
   0. 退出助手
 """)
         print("请输入数字：", terminator: "")
@@ -1904,9 +2072,12 @@ func interactiveMenu() -> Never {
         case "11":
             _ = restoreDailySplit(confirmed: false)
             waitForMenu()
+        case "12":
+            showClashNodeHealth()
+            waitForMenu()
         case "0", "q", "Q": exit(0)
         default:
-            print("无效选项，请输入 0 到 11。")
+            print("无效选项，请输入 0 到 12。")
             waitForMenu()
         }
     }
@@ -1929,6 +2100,8 @@ func usage() {
       net 清理       检查可清理的代理残留（不会直接清理）
       net 日志       查看最近 80 条操作与异常记录
       net clash日志  查看 Clash Verge 最近警告与错误
+      net clash路径  查看 Clash Verge 最近 TCP/UDP 路由选择
+      net 节点体检   读取 Clash fallback 节点的现有健康记录
       net 日志目录   在 Finder 中打开日志目录
       net 诊断       生成不含账号和节点信息的脱敏报告
       net 模式       查看当前分流、兜底或直连模式
@@ -1954,7 +2127,7 @@ func usage() {
 let arguments = Array(CommandLine.arguments.dropFirst())
 let safeAuditTokens = Set([
     "status", "看", "状态", "watch", "监看", "guard", "start", "stop", "repair", "清理",
-    "日志", "clash日志", "日志目录", "诊断", "install", "uninstall", "help", "--help", "-h",
+    "日志", "clash日志", "clash路径", "节点体检", "check-nodes", "日志目录", "诊断", "install", "uninstall", "help", "--help", "-h",
     "模式", "分流", "兜底", "直连", "切换", "恢复", "网络诊断", "mode", "split", "fallback", "direct", "switch-client", "restore-daily", "diagnose-network",
     "--yes", "--confirm", "v2rayn", "bywave", "clash", "powervpn", "viscosity", "hillstone", "tailscale"
 ])
@@ -1979,6 +2152,8 @@ case "repair", "清理":
     if !repair(options.contains("--yes") || options.contains("--confirm")) { exit(1) }
 case "日志": showRecentLogs()
 case "clash日志": showRecentClashLogs()
+case "clash路径": showRecentClashRoutes()
+case "节点体检", "check-nodes": showClashNodeHealth()
 case "日志目录": openLogsDirectory()
 case "诊断": _ = generateDiagnosticReport()
 case "模式": printModeStatus()

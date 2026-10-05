@@ -13,7 +13,7 @@ import Testing
     #expect(!parseCurlProbe(output: "", status: 0).ok)
 }
 
-@Test func rotatedClashLogsSurviveLaterLaunchAndAreDeduplicated() throws {
+@Test func clashLogsAreClassifiedAndDeduplicated() throws {
     let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: directory.appendingPathComponent("sidecar"), withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: directory) }
@@ -27,9 +27,21 @@ import Testing
     try "\(route)\n\(warning)\n[\(old)] level=error stale".write(to: directory.appendingPathComponent("sidecar/session.log"), atomically: true, encoding: .utf8)
     try warning.write(to: directory.appendingPathComponent("sidecar/sidecar_latest.log"), atomically: true, encoding: .utf8)
     try "[\(stamp)] INFO healthy startup".write(to: directory.appendingPathComponent("latest.log"), atomically: true, encoding: .utf8)
-    let result = recentClashLogLines(directory: directory, limit: 80, now: now)
-    #expect(result.count == 2)
-    #expect(result.contains(route))
-    #expect(result.contains(warning))
-    #expect(recentClashLogLines(directory: directory, limit: 1, now: now).count == 1)
+    let exceptions = recentClashLogLines(directory: directory, category: .exception, limit: 80, now: now)
+    let routes = recentClashLogLines(directory: directory, category: .route, limit: 80, now: now)
+    #expect(exceptions == [warning])
+    #expect(routes == [route])
+    #expect(recentClashLogLines(directory: directory, category: .exception, limit: 1, now: now).count == 1)
+}
+
+@Test func exceptionClassificationTakesPrecedenceOverRoutes() {
+    #expect(clashLogCategory(for: "[TCP] timeout while using fallback") == .exception)
+    #expect(clashLogCategory(for: "[UDP] match rule using DIRECT") == .route)
+    #expect(clashLogCategory(for: "healthy startup") == nil)
+}
+
+@Test func splitValidationRequiresTwoConsecutiveSuccessfulSamples() {
+    #expect(hasConsecutiveSuccesses([true, true], required: 2))
+    #expect(hasConsecutiveSuccesses([false, true, true], required: 2))
+    #expect(!hasConsecutiveSuccesses([true, false, true], required: 2))
 }

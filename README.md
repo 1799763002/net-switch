@@ -41,6 +41,8 @@ net 监看         # refresh the state every five seconds
 net 清理         # inspect safe-to-clean local proxy residue
 net 日志         # show recent events
 net clash日志    # show recent Clash Verge warnings, timeouts, and errors
+net clash路径    # show recent Clash Verge TCP/UDP route selections
+net 节点体检     # read existing Clash fallback-node health records
 net 日志目录     # open the local log directory in Finder
 net 诊断         # create a redacted diagnostic report
 net 模式         # show split, fallback, direct, conflict, or degraded mode
@@ -75,7 +77,8 @@ Special handling:
 - **PowerVPN**: refuses to exit while the configured macOS VPN service remains connected.
 - **Hillstone Secure Connect**: uses redacted local lifecycle state to decide whether a connection is active; its vendor background service is never stopped.
 - **Tailscale**: a stopped backend with no recognizable Tailscale route is treated as stopped even if a macOS network extension still appears attached.
-- **Network modes**: split mode keeps the Tailnet connected without an exit node, fallback mode uses the `vps-2026` exit node, and direct mode keeps private Tailnet access without public proxying. Failed transitions restore the previous exit-node, Clash, and proxy state.
+- **Network modes**: split mode keeps the Tailnet connected without an exit node, fallback mode uses the `vps-2026` exit node, and direct mode keeps private Tailnet access without public proxying. Split-mode completion requires two consecutive successful samples of the listener, all three system proxy settings, Tailnet state, mode state, and a Google proxy probe. Failed transitions restore the previous exit-node, Clash, and proxy state.
+- **Node health**: `net 节点体检` and `net 网络诊断` read the Clash fallback group's existing health history. They never switch nodes, edit the subscription, or start background probes.
 - **Standalone client switching**: `net 切换 <client>` releases both the managed system proxies and Tailscale routes before opening Viscosity, v2rayN, ByWave, PowerVPN, or Hillstone. A healthy external client running by itself is reported as `standalone`, not `conflict`. `net 恢复` safely exits it and restores the daily Tailscale + Clash split mode.
 - **Tailscale shutdown protection**: clearing an exit node is separate from taking Tailscale down; a full shutdown always requires `y/yes` or `--yes`.
 - **Guard behavior**: a mesh-only Tailscale connection no longer prevents stale local proxy cleanup, and automatic repair pauses while a mode transition lock exists.
@@ -86,7 +89,7 @@ Special handling:
 
 ## Logs and privacy
 
-Logs are local under `~/Library/Logs/net-switch/` and are retained for 30 days. Event logs track command invocations, menu selections, mode changes, duration, redacted before/after state, rollback results, refusal reasons, and errors. `launchd.log` may remain empty because events are written to `events-YYYY-MM-DD.log`. Diagnostics include only the last 24 hours of redacted Clash Verge warnings and errors and label older history as omitted.
+Logs are local under `~/Library/Logs/net-switch/` and are retained for 30 days. Event logs track command invocations, menu selections, mode changes, duration, redacted before/after state, rollback results, refusal reasons, and errors. `launchd.log` may remain empty because events are written to `events-YYYY-MM-DD.log`. `net clash日志` shows only the last 24 hours of redacted warnings and errors; `net clash路径` shows route selections separately. Diagnostics include only the former and label older history as omitted.
 
 `net 诊断` creates a redacted text report in the same directory. It reports only client names, high-level VPN state, proxy residue count, listening-port presence, guard state, and sanitized recent errors.
 
